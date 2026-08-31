@@ -1,0 +1,10 @@
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+.vscode/
+.idea/
+
+# 本地 ESP-IDF 工具链/构建缓存（勿提交）
+.trae-build/
+*.full.bin
