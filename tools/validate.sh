@@ -32,6 +32,15 @@ run_static_checks() {
         tests/test_place_fp.c main/place_fp.c \
         -o "${test_dir}/test_place_fp"
     "${test_dir}/test_place_fp"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_passport_social.c main/passport_social.c \
+        -o "${test_dir}/test_passport_social"
+    "${test_dir}/test_passport_social"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_passport_pet.c main/passport_pet.c \
+        -o "${test_dir}/test_passport_pet"
+    "${test_dir}/test_passport_pet"
+    bash main/assets/host_test/run.sh
     python3 tests/test_verify_firmware.py
     rm -rf "${test_dir}"
     echo "Host tests: PASS"

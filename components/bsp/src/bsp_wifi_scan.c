@@ -74,6 +74,12 @@ esp_err_t bsp_wifi_scan_once(bsp_wifi_ap_t *out, size_t max_out, size_t *out_cou
             .channel = 0,
             .show_hidden = false,
             .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+            // 13 channels * <=80 ms keeps the radio stage near the PRD's
+            // two-second budget while still allowing probe responses.
+            .scan_time.active = {
+                .min = 40,
+                .max = 80,
+            },
         };
         err = esp_wifi_scan_start(&scan_cfg, true);
         if (err != ESP_OK) {
