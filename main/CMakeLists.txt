@@ -18,9 +18,10 @@ idf_component_register(
          "passport_social.c"
          "passport_pet.c"
          "passport_ble.c"
+         "publisher_capture.c"
          "tribe_icon_pack.c"
          "assets/tribe_icons_mayday.c"
          "assets/pet_sprites.c"
     INCLUDE_DIRS "." "assets"
-    REQUIRES bsp bt esp_event esp_hw_support esp_netif esp_pm esp_timer esp_wifi nvs_flash
+    REQUIRES bsp bt esp_driver_usb_serial_jtag esp_event esp_hw_support esp_netif esp_pm esp_timer esp_wifi nvs_flash
 )
