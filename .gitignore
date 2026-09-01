@@ -4,6 +4,12 @@ sdkconfig.old
 managed_components/
 .vscode/
 .idea/
+.DS_Store
+
+# Local product input and asset-package notes; implementation sources remain tracked.
+main/prd1.md
+main/assets/README.md
+main/assets/INSTALL_TRAE.md
 
 # 本地 ESP-IDF 工具链/构建缓存（勿提交）
 .trae-build/

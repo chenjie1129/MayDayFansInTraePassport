@@ -15,6 +15,12 @@ idf_component_register(
          "answer_24.c"
          "demo_place.c"
          "place_fp.c"
-    INCLUDE_DIRS "."
-    REQUIRES bsp bt esp_event esp_hw_support esp_netif esp_timer esp_wifi nvs_flash
+         "passport_social.c"
+         "passport_pet.c"
+         "passport_ble.c"
+         "tribe_icon_pack.c"
+         "assets/tribe_icons_mayday.c"
+         "assets/pet_sprites.c"
+    INCLUDE_DIRS "." "assets"
+    REQUIRES bsp bt esp_event esp_hw_support esp_netif esp_pm esp_timer esp_wifi nvs_flash
 )

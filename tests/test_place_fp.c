@@ -1,8 +1,8 @@
 // tests/test_place_fp.c —— 场所指纹纯逻辑的主机侧单元测试(无硬件依赖,V0.2)。
 //
 // 编译运行:
-//   cc -std=c11 -Wall -Wextra -Werror -Imain \
-//     tests/test_place_fp.c main/place_fp.c -o /tmp/test_place_fp && /tmp/test_place_fp
+//   cc -std=c11 -Wall -Wextra -Werror -Imain tests/test_place_fp.c main/place_fp.c -o /tmp/test_place_fp
+//   /tmp/test_place_fp
 //
 // 覆盖:
 //   * 完全相同 / 部分重叠 / 完全不同 / 边界 500‰(Overlap 系数);

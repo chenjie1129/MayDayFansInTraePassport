@@ -1,474 +1,1132 @@
-// main/demo_place.c —— 离线「场所记忆」V0.2。
+// Places + nearby passports + Bubu pet.
 //
-// 机制:每 60 秒做一次 Wi-Fi 全信道扫描,取信号最强的 12 个 BSSID 作为当前
-// 地点指纹;与 NVS 中已保存的地点指纹做 Overlap 系数比对(交集/min(|A|,|B|)),
-// >=50% 判定为同一地点(到访次数 +1)。不联网、不用 GPS。
-//
-// V0.2 抗误判(真机实测:设备不动,边界 AP 的 RSSI 抖动会让单次 Jaccard
-// 跌破阈值而误建新地点):
-//   * 指纹 8 -> 12 个 BSSID,弱信号边界的进出对整体相似度影响更小;
-//   * Overlap 替代 Jaccard:本次多扫到几个弱 AP 不再拉低得分;
-//   * 迟滞:得分 350‰~499‰ 为灰区,或得分 <350‰ 的第一次,都【不建点】,
-//     只显示 CHECKING 并在 4 秒后快速重扫;连续 2 次明确不匹配才建新地点。
-//
-// 任务模型(遵循 AGENTS.md 不变量):
-//   * LVGL 任务 / 按键回调【绝不阻塞】:只做内存状态更新、queue 发送、UI 属性设置。
-//   * place worker(常驻、幂等创建,低优先级):Wi-Fi 扫描(阻塞 2~4s,协议栈
-//     每次扫描后 stop+deinit)、指纹匹配、NVS 读写全部在此任务;更新 UI 时短持
-//     bsp_lvgl_lock。
-//   * NVS 磨损:新地点立即落盘(不能丢失发现);到访次数脏数据每 5 分钟节流
-//     落盘一次,页面退出时补一次。
-//
-// 按键语义:
-//   OK 短按   -> 立即重新扫描
-//   UP/DOWN   -> 浏览已保存地点(循环)
-//   OK 长按   -> 返回菜单(由 main.c 统一拦截)
+// One persistent worker owns Wi-Fi, NimBLE, NVS, audio and all mutable model
+// data. Button callbacks only update small UI selectors and enqueue commands.
+// Each 60-second radio cycle is:
+//   Wi-Fi scan and full deinit -> 1 second RF guard -> bounded BLE window and
+//   full deinit -> idle remainder.
 #include "demo.h"
-#include "bsp_display.h"        // bsp_lvgl_lock/unlock
-#include "bsp_battery.h"
-#include "bsp_wifi_scan.h"
+#include "demo_radio.h"
+#include "passport_ble.h"
+#include "passport_pet.h"
+#include "passport_social.h"
 #include "place_fp.h"
+#include "pet_sprites.h"
+#include "tribe_icon_pack.h"
 #include "ui_pixel.h"
 
-#include "lvgl.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
-#include "freertos/semphr.h"
-#include "nvs_flash.h"
-#include "nvs.h"
+#include "bsp_audio.h"
+#include "bsp_battery.h"
+#include "bsp_display.h"
+#include "bsp_wifi_scan.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_pm.h"
+#include "esp_random.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+#include "lvgl.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
-#include <inttypes.h>
 
-static const char *TAG = "place";
+static const char *TAG = "places_social";
 
-#define SCAN_INTERVAL_MS    60000    // 常规扫描周期
-#define QUICK_RESCAN_MS     4000     // CHECKING(灰区/待确认)后的快速重扫间隔
-#define FLUSH_THROTTLE_MS   300000   // 到访次数落盘节流:5 分钟
-#define NVS_NAMESPACE       "placemem"
-#define NVS_KEY_DB          "db"
-#define PLACE_DB_MAGIC      0x504C4331u
-#define PLACE_DB_VERSION    2        // V0.2: 指纹 8->12 BSSID,blob 布局变更
+#define CYCLE_MS                60000u
+#define RF_GUARD_MS              1000u
+#define QUICK_RESCAN_MS          4000u
+#define FLUSH_THROTTLE_MS      300000u
+#define NVS_NAMESPACE        "placemem"
+#define NVS_KEY_PLACES             "db"
+#define NVS_KEY_SOCIAL         "social"
+#define PLACE_DB_MAGIC       0x504c4331u
+#define PLACE_DB_VERSION              2u
+#define SOCIAL_MAGIC         0x534f4331u
+#define SOCIAL_VERSION                1u
+#define DEFAULT_TRIBE_CODE       0x4d44u
+#define TRAIL_MAX                    24u
+#define NVS_ENTRY_BYTES              32u
+#define NVS_BLOB_ENTRY_COUNT(bytes)  (2u + (((bytes) + 31u) / 32u))
 
-// worker 队列消息
-#define MSG_ACTIVE  1   // 进入页面:开始周期扫描(立即扫一次)
-#define MSG_IDLE    2   // 退出页面:停止扫描并落盘
-#define MSG_SCAN    3   // OK 短按:立即重扫
+typedef enum {
+    CMD_ACTIVE = 1,
+    CMD_IDLE,
+    CMD_SCAN,
+    CMD_RENDER,
+    CMD_NAME_PLACE,
+    CMD_NEXT_ARCHIVE,
+    CMD_NEXT_SIGNAL,
+    CMD_NEXT_ICON,
+    CMD_TOGGLE_STEALTH,
+    CMD_TOGGLE_REGULARS,
+    CMD_NEXT_REGULAR,
+    CMD_RESET_ID,
+} command_type_t;
 
-/* ---------------- 持久化(仅 worker 任务访问,NVS blob ≈1KB) ---------------- */
-static place_db_t   s_db;
+typedef struct {
+    uint8_t type;
+    uint8_t value;
+} command_t;
+
+typedef enum {
+    VIEW_LIVE = 0,
+    VIEW_ARCHIVE,
+    VIEW_TRAIL,
+    VIEW_SIGNAL,
+    VIEW_ICON,
+    VIEW_STEALTH,
+    VIEW_REGULARS,
+    VIEW_PET,
+    VIEW_RESET_ID,
+    VIEW_COUNT,
+} place_view_t;
+
+typedef struct {
+    uint8_t icon;
+    uint8_t reserved[3];
+    uint32_t stay_seconds;
+} place_meta_t;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t size;
+    uint16_t anonymous_id;
+    uint16_t tribe_code;
+    uint8_t signal_code;
+    uint8_t icon_index;
+    uint8_t stealth;
+    uint8_t regulars_enabled;
+    uint8_t pet_stage;
+    uint8_t crowd_events;
+    uint16_t reserved;
+    uint32_t same_tribe_encounters;
+    uint32_t runtime_without_new_place_seconds;
+    place_meta_t place_meta[PLACE_MAX_COUNT];
+    passport_regular_db_t regulars;
+    passport_memorial_db_t memorials;
+} social_state_t;
+
+typedef struct {
+    uint8_t place_index;
+    uint8_t icon;
+} trail_event_t;
+
+_Static_assert(sizeof(social_state_t) < 2048, "social NVS blob must stay compact");
+
+static const char *const PLACE_NAMES[] = {
+    "HOME", "WORK", "CAFE", "METRO", "GYM", "CUSTOM",
+};
+static const uint32_t PLACE_COLORS[] = {
+    0xE85D5D, 0x4C78A8, 0xD9983D, 0x845EC2, 0x3C9D72, 0x64748B,
+};
+static const char *const SIGNAL_NAMES[] = {
+    "HELLO", "COFFEE BREAK", "DDL - BUSY", "LET'S PLAY", "NEED HELP",
+};
+static const char *const ICON_NAMES[] = {
+    "CARROT", "RABBIT", "PINK", "RED", "GREEN", "BLUE", "YELLOW", "NINEBALL",
+};
+static const char *const PET_FORM_NAMES[] = {
+    "SEED", "SPROUT", "YOUNG", "BUBU", "TRAVELER", "WORLD",
+};
+static const char *const PET_TRAIT_NAMES[] = {
+    "HOMEBODY", "ROVER", "SOCIAL", "SOLO", "ARENA",
+};
+
+static place_db_t s_db;
+static social_state_t s_social;
 static nvs_handle_t s_nvs;
-static bool         s_nvs_ok;
-static bool         s_dirty;          // 有未落盘的到访次数
-static SemaphoreHandle_t s_db_mutex; // 保护 s_db:worker 写 / 按键回调读(浏览)
+static bool s_nvs_ok;
+static bool s_dirty;
 
-static void db_reset(void)
+static QueueHandle_t s_queue;
+static TaskHandle_t s_worker;
+static volatile bool s_active;
+static volatile bool s_scanning;
+static volatile uint32_t s_next_due;
+static volatile place_view_t s_view;
+static volatile int s_pending_name = -1;
+static volatile uint8_t s_name_choice;
+static uint8_t s_archive_rank;
+static uint8_t s_regular_cursor;
+
+static int s_current_place = -1;
+static uint32_t s_last_account_ms;
+static uint8_t s_current_place_hash;
+static place_session_t s_match_session;
+static trail_event_t s_trail[TRAIL_MAX];
+static uint8_t s_trail_count;
+static bool s_crowd_active;
+static uint32_t s_crowd_started_ms;
+static passport_crowd_counter_t s_crowd_peak;
+static passport_payload_t s_last_peer;
+static bool s_have_peer;
+static uint16_t s_other_tribe_count;
+static uint32_t s_encounter_until_ms;
+static bool s_quiet_message;
+static int s_last_score = -1;
+static char s_live_status[32] = "STARTING...";
+static char s_live_detail[96] = "Waiting for first scan";
+
+static lv_obj_t *s_scr;
+static lv_obj_t *s_title;
+static lv_obj_t *s_status;
+static lv_obj_t *s_detail;
+static lv_obj_t *s_footer;
+static lv_obj_t *s_soc;
+static lv_obj_t *s_dot;
+static lv_obj_t *s_local_pet;
+static lv_obj_t *s_peer_pet;
+static lv_obj_t *s_icon;
+static lv_obj_t *s_idle_mark;
+static lv_obj_t *s_trail_blocks[12];
+static lv_timer_t *s_timer;
+static bool s_breath_up;
+static uint8_t s_encounter_phase;
+static uint8_t s_animation_divider;
+
+static uint32_t now_ms(void)
 {
-    memset(&s_db, 0, sizeof(s_db));
-    s_db.magic   = PLACE_DB_MAGIC;
-    s_db.version = PLACE_DB_VERSION;
-    s_db.count   = 0;
+    return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
 
-// 仅在 worker 启动时调用一次。
-static void db_load(void)
+static void set_idle_power_mode(bool enabled)
 {
-    nvs_flash_init();   // 幂等;失败不擦除分区
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &s_nvs) != ESP_OK) {
+    esp_pm_config_t config = {
+        .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .min_freq_mhz = enabled ? 40 : CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .light_sleep_enable = enabled,
+    };
+    esp_err_t err = esp_pm_configure(&config);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "automatic light sleep %s failed: %s",
+                 enabled ? "enable" : "disable", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "automatic light sleep %s",
+                 enabled ? "enabled for radio idle" : "disabled");
+    }
+}
+
+static uint16_t random_nonzero_id(void)
+{
+    uint16_t id = 0;
+    while (id == 0) id = (uint16_t)esp_random();
+    return id;
+}
+
+static void place_db_reset(void)
+{
+    memset(&s_db, 0, sizeof(s_db));
+    s_db.magic = PLACE_DB_MAGIC;
+    s_db.version = PLACE_DB_VERSION;
+}
+
+static void social_reset(void)
+{
+    memset(&s_social, 0, sizeof(s_social));
+    s_social.magic = SOCIAL_MAGIC;
+    s_social.version = SOCIAL_VERSION;
+    s_social.size = sizeof(s_social);
+    s_social.anonymous_id = random_nonzero_id();
+    s_social.tribe_code = DEFAULT_TRIBE_CODE;
+}
+
+static bool place_db_valid(const place_db_t *places)
+{
+    if (places->magic != PLACE_DB_MAGIC ||
+        places->version != PLACE_DB_VERSION ||
+        places->count > PLACE_MAX_COUNT) {
+        return false;
+    }
+    for (uint16_t i = 0; i < places->count; i++) {
+        if (places->places[i].fp.count > PLACE_FP_BSSID_COUNT) return false;
+    }
+    return true;
+}
+
+static void social_sanitize(void)
+{
+    if (s_social.anonymous_id == 0) s_social.anonymous_id = random_nonzero_id();
+    if (s_social.signal_code >= PASSPORT_SIGNAL_COUNT) s_social.signal_code = 0;
+    if (s_social.icon_index >= PASSPORT_ICON_COUNT) s_social.icon_index = 0;
+    if (s_social.regulars.count > PASSPORT_REGULAR_MAX) s_social.regulars.count = 0;
+    if (s_social.memorials.count > PASSPORT_MEMORIAL_MAX) s_social.memorials.count = 0;
+    for (uint8_t i = 0; i < PLACE_MAX_COUNT; i++) {
+        if (s_social.place_meta[i].icon >= 6) s_social.place_meta[i].icon = 5;
+    }
+}
+
+static void storage_load(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err != ESP_OK ||
+        nvs_open(NVS_NAMESPACE, NVS_READWRITE, &s_nvs) != ESP_OK) {
         s_nvs_ok = false;
-        ESP_LOGE(TAG, "NVS 打开失败,地点无法持久化(本次运行仍可扫描)");
-        db_reset();
+        place_db_reset();
+        social_reset();
+        ESP_LOGE(TAG, "NVS unavailable; running with volatile state");
         return;
     }
     s_nvs_ok = true;
-    place_db_t tmp;
-    size_t len = sizeof(tmp);
-    esp_err_t err = nvs_get_blob(s_nvs, NVS_KEY_DB, &tmp, &len);
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
-        db_reset();   // 首次使用,库本来就为空
-    } else if (err != ESP_OK || len != sizeof(tmp) ||
-               tmp.magic != PLACE_DB_MAGIC || tmp.version != PLACE_DB_VERSION ||
-               tmp.count > PLACE_MAX_COUNT) {
-        // 固件升级导致 blob 布局变化(如 V0.1 的 8-BSSID 指纹)时,旧库作废重建,
-        // 绝不按新布局解析旧字节(会把相邻记录当 BSSID 读入垃圾)。
-        ESP_LOGW(TAG, "地点库不兼容(err=%s len=%u ver=%u),已重置为空库",
-                 esp_err_to_name(err), (unsigned)len,
-                 (err == ESP_OK) ? tmp.version : 0u);
-        db_reset();
+
+    place_db_t places;
+    size_t len = sizeof(places);
+    err = nvs_get_blob(s_nvs, NVS_KEY_PLACES, &places, &len);
+    if (err == ESP_OK && len == sizeof(places) && place_db_valid(&places)) {
+        s_db = places;
+        for (uint16_t i = 0; i < s_db.count; i++) {
+            s_db.places[i].name[PLACE_NAME_MAX - 1] = '\0';
+        }
     } else {
-        s_db = tmp;
+        place_db_reset();
     }
-    ESP_LOGI(TAG, "已加载 %u 个已保存地点", (unsigned)s_db.count);
+
+    social_state_t social;
+    len = sizeof(social);
+    err = nvs_get_blob(s_nvs, NVS_KEY_SOCIAL, &social, &len);
+    if (err == ESP_OK && len == sizeof(social) &&
+        social.magic == SOCIAL_MAGIC &&
+        social.version == SOCIAL_VERSION &&
+        social.size == sizeof(social)) {
+        s_social = social;
+    } else {
+        social_reset();
+        s_dirty = true;
+    }
+    social_sanitize();
+    s_social.pet_stage =
+        passport_pet_stage_update(s_social.pet_stage, (uint8_t)s_db.count);
+    ESP_LOGI(TAG, "loaded places=%u regulars=%u memorials=%u nvs_raw=%u bytes",
+             (unsigned)s_db.count, (unsigned)s_social.regulars.count,
+             (unsigned)s_social.memorials.count,
+             (unsigned)(sizeof(s_db) + sizeof(s_social)));
 }
 
-// 调用方必须持有 s_db_mutex。
-static void db_flush_locked(void)
+static void storage_flush(void)
 {
     if (!s_nvs_ok || !s_dirty) return;
-    nvs_set_blob(s_nvs, NVS_KEY_DB, &s_db, sizeof(s_db));
-    nvs_commit(s_nvs);
-    s_dirty = false;
+    esp_err_t a = nvs_set_blob(s_nvs, NVS_KEY_PLACES, &s_db, sizeof(s_db));
+    esp_err_t b = nvs_set_blob(s_nvs, NVS_KEY_SOCIAL, &s_social, sizeof(s_social));
+    esp_err_t c = (a == ESP_OK && b == ESP_OK) ? nvs_commit(s_nvs) : ESP_FAIL;
+    if (a == ESP_OK && b == ESP_OK && c == ESP_OK) {
+        s_dirty = false;
+        const unsigned feature_entries =
+            1u + NVS_BLOB_ENTRY_COUNT(sizeof(s_db)) +
+            NVS_BLOB_ENTRY_COUNT(sizeof(s_social));
+        nvs_stats_t stats;
+        if (nvs_get_stats(NULL, &stats) == ESP_OK) {
+            ESP_LOGI(TAG,
+                     "NVS feature raw=%u allocated=%u bytes (%u entries); "
+                     "partition_used=%u bytes",
+                     (unsigned)(sizeof(s_db) + sizeof(s_social)),
+                     feature_entries * NVS_ENTRY_BYTES, feature_entries,
+                     (unsigned)(stats.used_entries * NVS_ENTRY_BYTES));
+        }
+    } else {
+        ESP_LOGE(TAG, "NVS flush failed: %s/%s/%s",
+                 esp_err_to_name(a), esp_err_to_name(b), esp_err_to_name(c));
+    }
 }
 
-/* ---------------- UI 对象 ---------------- */
-static lv_obj_t  *s_scr;
-static lv_obj_t  *s_lbl_status, *s_lbl_fp, *s_lbl_match, *s_lbl_saved;
-static lv_obj_t  *s_lbl_browse, *s_lbl_next, *s_lbl_soc;
-static lv_timer_t *s_timer;
-
-static QueueHandle_t s_q;
-static TaskHandle_t  s_worker;
-static volatile bool s_active;       // 页面是否在前台
-static volatile bool s_scanning;     // 当前是否阻塞扫描中
-static volatile uint32_t s_next_due; // 下次计划扫描的 tick(ms)
-static int s_browse = -1;            // 浏览中的地点索引;-1 = 实时视图
-static place_session_t s_sess;       // 迟滞判定会话(进页面清零,仅 worker 访问)
-
-static const char *strength_label(int avg_rssi)
+static void heap_report(const char *stage, size_t before_min, size_t before_largest)
 {
-    if (avg_rssi >= -50) return "STRONG";
-    if (avg_rssi >= -65) return "GOOD";
-    if (avg_rssi >= -75) return "WEAK";
-    return "POOR";
+    size_t min_now = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG, "HEAP %-8s min=%u delta=%d largest=%u delta=%d",
+             stage, (unsigned)min_now, (int)min_now - (int)before_min,
+             (unsigned)largest, (int)largest - (int)before_largest);
 }
 
-// 所有 worker -> UI 的更新都走这里:短持 LVGL 锁,页面退出后(s_scr==NULL)直接跳过。
-static void ui_publish(const char *status, uint32_t status_color,
-                       const char *fp, const char *match, const char *saved)
+static void append_trail(uint8_t place_index)
+{
+    if (s_trail_count > 0 &&
+        s_trail[s_trail_count - 1].place_index == place_index) return;
+    if (s_trail_count == TRAIL_MAX) {
+        memmove(&s_trail[0], &s_trail[1],
+                (TRAIL_MAX - 1) * sizeof(s_trail[0]));
+        s_trail_count--;
+    }
+    s_trail[s_trail_count].place_index = place_index;
+    s_trail[s_trail_count].icon = s_social.place_meta[place_index].icon;
+    s_trail_count++;
+}
+
+static void account_current_place(uint32_t current_ms)
+{
+    if (s_current_place < 0 || s_current_place >= (int)s_db.count ||
+        s_last_account_ms == 0) {
+        s_last_account_ms = current_ms;
+        return;
+    }
+    uint32_t elapsed = (uint32_t)(current_ms - s_last_account_ms) / 1000u;
+    if (elapsed > 0) {
+        uint32_t *stay = &s_social.place_meta[s_current_place].stay_seconds;
+        *stay = UINT32_MAX - *stay < elapsed ? UINT32_MAX : *stay + elapsed;
+        s_social.runtime_without_new_place_seconds =
+            UINT32_MAX - s_social.runtime_without_new_place_seconds < elapsed
+                ? UINT32_MAX
+                : s_social.runtime_without_new_place_seconds + elapsed;
+        s_dirty = true;
+        s_last_account_ms = current_ms;
+    }
+}
+
+static int archive_index_for_rank(uint8_t rank)
+{
+    if (s_db.count == 0) return -1;
+    uint16_t used = 0;
+    int chosen = -1;
+    for (uint8_t r = 0; r <= rank % s_db.count; r++) {
+        chosen = -1;
+        for (uint8_t i = 0; i < s_db.count; i++) {
+            if ((used & (1u << i)) != 0) continue;
+            if (chosen < 0 ||
+                s_social.place_meta[i].stay_seconds >
+                    s_social.place_meta[chosen].stay_seconds) {
+                chosen = i;
+            }
+        }
+        if (chosen >= 0) used |= (uint16_t)(1u << chosen);
+    }
+    return chosen;
+}
+
+static passport_pet_stats_t pet_stats(void)
+{
+    passport_pet_stats_t stats;
+    memset(&stats, 0, sizeof(stats));
+    stats.place_count = (uint8_t)s_db.count;
+    stats.same_tribe_encounters = s_social.same_tribe_encounters;
+    stats.crowd_events = s_social.crowd_events;
+    for (uint8_t i = 0; i < s_db.count; i++) {
+        stats.total_visits += s_db.places[i].visits;
+        stats.total_stay_seconds += s_social.place_meta[i].stay_seconds;
+        if (s_social.place_meta[i].stay_seconds > stats.longest_place_seconds) {
+            stats.longest_place_seconds = s_social.place_meta[i].stay_seconds;
+        }
+    }
+    return stats;
+}
+
+static void hide_optional_locked(void)
+{
+    lv_obj_add_flag(s_local_pet, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_peer_pet, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_icon, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_idle_mark, LV_OBJ_FLAG_HIDDEN);
+    for (size_t i = 0; i < 12; i++) lv_obj_add_flag(s_trail_blocks[i], LV_OBJ_FLAG_HIDDEN);
+}
+
+static void render_name_locked(void)
+{
+    lv_label_set_text(s_title, "NAME NEW PLACE");
+    lv_label_set_text_fmt(s_status, "<  %s  >", PLACE_NAMES[s_name_choice]);
+    lv_label_set_text(s_detail, "UP/DOWN: choose preset\nOK: confirm");
+    lv_label_set_text(s_footer, "No date or location leaves device");
+    hide_optional_locked();
+}
+
+static void render_view_locked(void)
+{
+    if (!s_scr) return;
+    if (s_pending_name >= 0) {
+        render_name_locked();
+        return;
+    }
+
+    hide_optional_locked();
+    lv_label_set_text(s_footer, "UP/DOWN: view   OK: action");
+    lv_label_set_text_fmt(s_dot, "%u", (unsigned)s_other_tribe_count);
+    if (s_other_tribe_count) lv_obj_clear_flag(s_dot, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(s_dot, LV_OBJ_FLAG_HIDDEN);
+
+    switch (s_view) {
+    case VIEW_LIVE:
+        lv_label_set_text(s_title, "PLACES + NEARBY");
+        lv_label_set_text(s_status, s_live_status);
+        lv_label_set_text(s_detail, s_live_detail);
+        if (s_have_peer && (int32_t)(s_encounter_until_ms - now_ms()) > 0) {
+            uint8_t local_stage = s_social.pet_stage < 6 ? s_social.pet_stage : 5;
+            uint8_t peer_stage = s_last_peer.pet_stage < 6 ? s_last_peer.pet_stage : 5;
+            lv_image_set_src(s_local_pet, pet_form_sprites[local_stage]);
+            lv_image_set_src(s_peer_pet, pet_form_sprites[peer_stage]);
+            lv_obj_set_pos(s_local_pet, 28, 78);
+            lv_obj_set_pos(s_peer_pet, 126, 78);
+            lv_obj_clear_flag(s_local_pet, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(s_peer_pet, LV_OBJ_FLAG_HIDDEN);
+        }
+        break;
+    case VIEW_ARCHIVE: {
+        lv_label_set_text(s_title, "PLACE ARCHIVE");
+        int idx = archive_index_for_rank(s_archive_rank);
+        if (idx < 0) {
+            lv_label_set_text(s_status, "NO SAVED PLACE");
+            lv_label_set_text(s_detail, "Run a scan first");
+        } else {
+            uint32_t seconds = s_social.place_meta[idx].stay_seconds;
+            lv_label_set_text_fmt(s_status, "#%d  %s", idx + 1, s_db.places[idx].name);
+            lv_label_set_text_fmt(s_detail,
+                                  "STAY %" PRIu32 "m  VISITS %u\nsorted by total stay",
+                                  seconds / 60u, (unsigned)s_db.places[idx].visits);
+        }
+        break;
+    }
+    case VIEW_TRAIL:
+        lv_label_set_text(s_title, "THIS BOOT TRAIL");
+        lv_label_set_text_fmt(s_status, "%u transitions", (unsigned)s_trail_count);
+        lv_label_set_text(s_detail, "Oldest                         Newest");
+        for (uint8_t i = 0; i < s_trail_count && i < 12; i++) {
+            uint8_t source = s_trail_count > 12 ? (uint8_t)(s_trail_count - 12 + i) : i;
+            uint8_t icon = s_trail[source].icon;
+            lv_obj_set_style_bg_color(s_trail_blocks[i],
+                                      lv_color_hex(PLACE_COLORS[icon % 6]), 0);
+            lv_obj_clear_flag(s_trail_blocks[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        break;
+    case VIEW_SIGNAL:
+        lv_label_set_text(s_title, "SIGNAL");
+        lv_label_set_text_fmt(s_status, "%u/5  %s",
+                              (unsigned)s_social.signal_code + 1,
+                              SIGNAL_NAMES[s_social.signal_code]);
+        lv_label_set_text(s_detail, "OK: broadcast next signal");
+        break;
+    case VIEW_ICON:
+        lv_label_set_text(s_title, "TRIBE ICON");
+        lv_label_set_text(s_status, ICON_NAMES[s_social.icon_index]);
+        lv_label_set_text(s_detail,
+                          s_social.icon_index == PASSPORT_QUIET_ICON
+                              ? "Quiet mood: no sound/animation"
+                              : "OK: choose next icon");
+        lv_image_set_src(s_icon,
+                         tribe_icon_get(&tribe_icon_pack_active,
+                                        s_social.icon_index));
+        lv_obj_align(s_icon, LV_ALIGN_BOTTOM_MID, 0, -8);
+        lv_obj_clear_flag(s_icon, LV_OBJ_FLAG_HIDDEN);
+        break;
+    case VIEW_STEALTH:
+        lv_label_set_text(s_title, "STEALTH");
+        lv_label_set_text(s_status, s_social.stealth ? "ON: SCAN ONLY" : "OFF: VISIBLE");
+        lv_label_set_text(s_detail, "OK: toggle (saved in NVS)");
+        break;
+    case VIEW_REGULARS:
+        lv_label_set_text(s_title, "REGULARS");
+        lv_label_set_text(s_status, s_social.regulars_enabled ? "OPTED IN" : "OFF BY DEFAULT");
+        if (!s_social.regulars_enabled) {
+            lv_label_set_text(s_detail, "No profiles are stored\nOK: opt in");
+        } else if (s_social.regulars.count == 0) {
+            lv_label_set_text(s_detail, "0/32 profiles\nOK: turn off");
+        } else {
+            passport_regular_t *regular =
+                &s_social.regulars.records[s_regular_cursor % s_social.regulars.count];
+            const char *place_name =
+                regular->favorite_place < s_db.count
+                    ? s_db.places[regular->favorite_place].name
+                    : "UNKNOWN";
+            lv_label_set_text_fmt(s_detail,
+                                  "#%04X met %u times\nmostly %s: %u / OK next",
+                                  regular->anonymous_id,
+                                  (unsigned)regular->encounters, place_name,
+                                  (unsigned)regular->favorite_place_count);
+        }
+        break;
+    case VIEW_PET: {
+        passport_pet_stats_t stats = pet_stats();
+        uint8_t trait = passport_pet_trait(&stats);
+        bool idle = passport_pet_is_idle(s_social.runtime_without_new_place_seconds, 0);
+        lv_label_set_text(s_title, "BUBU");
+        lv_label_set_text_fmt(s_status, "%s  %u/16 places",
+                              PET_FORM_NAMES[s_social.pet_stage], (unsigned)s_db.count);
+        if (trait == PASSPORT_PET_TRAIT_NONE) {
+            lv_label_set_text(s_detail, idle ? "DAYDREAMING... no progress lost" : "Keep discovering places");
+        } else {
+            lv_label_set_text_fmt(s_detail, "%s%s",
+                                  PET_TRAIT_NAMES[trait],
+                                  idle ? " / DAYDREAMING" : "");
+        }
+        lv_image_set_src(s_local_pet, pet_form_sprites[s_social.pet_stage]);
+        lv_obj_set_pos(s_local_pet, 72, 76);
+        lv_obj_clear_flag(s_local_pet, LV_OBJ_FLAG_HIDDEN);
+        if (trait != PASSPORT_PET_TRAIT_NONE) {
+            lv_image_set_src(s_icon, pet_acc_sprites[trait]);
+            lv_obj_set_pos(s_icon,
+                           72 + pet_form_anchors[s_social.pet_stage].x,
+                           76 + pet_form_anchors[s_social.pet_stage].y);
+            lv_obj_clear_flag(s_icon, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (idle) lv_obj_clear_flag(s_idle_mark, LV_OBJ_FLAG_HIDDEN);
+        break;
+    }
+    case VIEW_RESET_ID:
+        lv_label_set_text(s_title, "ANONYMOUS ID");
+        lv_label_set_text_fmt(s_status, "%04X", s_social.anonymous_id);
+        lv_label_set_text(s_detail, "OK: generate a new ID\nBLE MAC is never used");
+        break;
+    default:
+        break;
+    }
+}
+
+static void render_view(void)
 {
     if (!bsp_lvgl_lock(300)) return;
-    if (s_scr) {
-        if (s_lbl_status) {
-            lv_label_set_text(s_lbl_status, status);
-            lv_obj_set_style_text_color(s_lbl_status, lv_color_hex(status_color), 0);
-        }
-        if (fp && s_lbl_fp)        lv_label_set_text(s_lbl_fp, fp);
-        if (match && s_lbl_match)  lv_label_set_text(s_lbl_match, match);
-        if (saved && s_lbl_saved)  lv_label_set_text(s_lbl_saved, saved);
-        s_browse = -1;
-        if (s_lbl_browse) lv_label_set_text(s_lbl_browse, "LIVE");
-        if (s_lbl_soc) {
-            int soc = bsp_battery_soc();
-            if (soc < 0) lv_label_set_text(s_lbl_soc, "");
-            else         lv_label_set_text_fmt(s_lbl_soc, "%d%%", soc);
-        }
+    render_view_locked();
+    bsp_lvgl_unlock();
+}
+
+static void update_battery_from_worker(void)
+{
+    int soc = bsp_battery_soc();
+    if (!bsp_lvgl_lock(300)) return;
+    if (s_soc) {
+        if (soc >= 0) lv_label_set_text_fmt(s_soc, "%d%%", soc);
+        else lv_label_set_text(s_soc, "");
     }
     bsp_lvgl_unlock();
 }
 
-/* ---------------- 扫描周期(worker 任务) ---------------- */
-// 返回距下次扫描的等待毫秒:CHECKING(灰区/待确认)时 4s 快速重扫,其余 60s。
-static uint32_t run_cycle(void)
+static void show_live(const char *status, const char *detail)
 {
+    snprintf(s_live_status, sizeof(s_live_status), "%s", status);
+    snprintf(s_live_detail, sizeof(s_live_detail), "%s", detail);
+    if (s_view == VIEW_LIVE) render_view();
+}
+
+static void play_encounter_tone(void)
+{
+    int16_t pcm[800];
+    for (size_t i = 0; i < sizeof(pcm) / sizeof(pcm[0]); i++) {
+        pcm[i] = ((i / 20u) & 1u) ? 5500 : -5500;
+    }
+    if (bsp_audio_set_format(16000, 16, 1) == ESP_OK) {
+        bsp_audio_set_volume(55);
+        bsp_audio_write(pcm, sizeof(pcm));
+    }
+}
+
+static void finish_crowd(uint32_t current_ms);
+
+static void process_ble_result(const passport_ble_result_t *result,
+                               uint32_t current_ms)
+{
+    s_other_tribe_count = result->other_tribe_count;
+    bool crowd = result->crowd.unique_count > PASSPORT_CROWD_THRESHOLD;
+    if (crowd) {
+        if (!s_crowd_active) {
+            s_crowd_active = true;
+            s_crowd_started_ms = current_ms;
+        }
+        if (result->crowd.unique_count >= s_crowd_peak.unique_count) {
+            s_crowd_peak = result->crowd;
+        }
+        snprintf(s_live_status, sizeof(s_live_status), "GATHERING: %u",
+                 (unsigned)result->crowd.unique_count);
+        snprintf(s_live_detail, sizeof(s_live_detail),
+                 "0:%u 1:%u 2:%u 3:%u\n4:%u 5:%u 6:%u 7:%u",
+                 (unsigned)result->crowd.icon_counts[0],
+                 (unsigned)result->crowd.icon_counts[1],
+                 (unsigned)result->crowd.icon_counts[2],
+                 (unsigned)result->crowd.icon_counts[3],
+                 (unsigned)result->crowd.icon_counts[4],
+                 (unsigned)result->crowd.icon_counts[5],
+                 (unsigned)result->crowd.icon_counts[6],
+                 (unsigned)result->crowd.icon_counts[7]);
+        s_dirty = true;
+        return;
+    }
+
+    finish_crowd(current_ms);
+
+    for (uint8_t i = 0; i < result->peer_count; i++) {
+        const passport_payload_t *peer = &result->peers[i];
+        s_last_peer = *peer;
+        if (s_social.same_tribe_encounters != UINT32_MAX) {
+            s_social.same_tribe_encounters++;
+        }
+        if (s_social.regulars_enabled && s_current_place >= 0) {
+            passport_regular_observe(&s_social.regulars, peer->anonymous_id,
+                                     (uint8_t)s_current_place, current_ms);
+        }
+        passport_feedback_t feedback =
+            passport_feedback_route(s_social.tribe_code, peer);
+        s_quiet_message = feedback == PASSPORT_FEEDBACK_QUIET;
+        s_have_peer = !s_quiet_message;
+        s_encounter_until_ms = current_ms + 4000u;
+        s_encounter_phase = 0;
+        if (s_quiet_message) {
+            snprintf(s_live_detail, sizeof(s_live_detail),
+                     "Quiet signal from #%04X", peer->anonymous_id);
+        } else {
+            snprintf(s_live_detail, sizeof(s_live_detail),
+                     "Met #%04X / %s / %s",
+                     peer->anonymous_id, ICON_NAMES[peer->icon_index],
+                     SIGNAL_NAMES[peer->signal_code]);
+            play_encounter_tone();
+        }
+        s_dirty = true;
+    }
+}
+
+static void finish_crowd(uint32_t current_ms)
+{
+    if (!s_crowd_active) return;
+    passport_memorial_t memorial;
+    memset(&memorial, 0, sizeof(memorial));
+    memorial.unique_count = s_crowd_peak.unique_count;
+    memorial.place_hash = s_current_place_hash;
+    memorial.duration_seconds = (current_ms - s_crowd_started_ms) / 1000u;
+    memcpy(memorial.icon_counts, s_crowd_peak.icon_counts,
+           sizeof(memorial.icon_counts));
+    passport_memorial_add(&s_social.memorials, &memorial);
+    if (s_social.crowd_events != UINT8_MAX) s_social.crowd_events++;
+    s_crowd_active = false;
+    s_dirty = true;
+}
+
+static uint32_t wifi_stage(void)
+{
+    size_t min_before =
+        heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t largest_before =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    uint32_t started = now_ms();
     s_scanning = true;
-    ui_publish("SCANNING...", UI_SKY_DARK, NULL, NULL, NULL);
+    show_live("WI-FI SCAN", "Building location fingerprint");
 
     bsp_wifi_ap_t aps[BSP_WIFI_SCAN_MAX];
     size_t n = 0;
     esp_err_t err = bsp_wifi_scan_once(aps, BSP_WIFI_SCAN_MAX, &n);
-
     s_scanning = false;
-    if (!s_active) return SCAN_INTERVAL_MS;   // 扫描期间页面已退出,结果丢弃
-
+    heap_report("wifi-off", min_before, largest_before);
+    if (!s_active) return CYCLE_MS;
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Wi-Fi 扫描失败: %s", esp_err_to_name(err));
-        char mline[48];
-        snprintf(mline, sizeof(mline), "WI-FI FAIL: %s", esp_err_to_name(err));
-        ui_publish("WI-FI FAIL", UI_RED, "FP: --", mline, NULL);
-        return SCAN_INTERVAL_MS;
+        show_live("WI-FI FAILED", esp_err_to_name(err));
+        return CYCLE_MS;
     }
 
-    place_ap_t pa[BSP_WIFI_SCAN_MAX];
+    place_ap_t input[BSP_WIFI_SCAN_MAX];
     for (size_t i = 0; i < n; i++) {
-        memcpy(pa[i].bssid, aps[i].bssid, 6);
-        pa[i].rssi = aps[i].rssi;
+        memcpy(input[i].bssid, aps[i].bssid, 6);
+        input[i].rssi = aps[i].rssi;
     }
-
     place_fingerprint_t fp;
-    place_fp_build(&fp, pa, n);
+    place_fp_build(&fp, input, n);
     if (fp.count == 0) {
-        ui_publish("NO AP FOUND", UI_RED, "FP: 0 APs", "move around and rescan", NULL);
-        return SCAN_INTERVAL_MS;
+        show_live("NO ACCESS POINT", "Move and try again");
+        return CYCLE_MS;
     }
 
-    // 指纹强度:指纹内 12 个 BSSID 的平均 RSSI
-    int sum = 0, cnt = 0;
-    for (uint8_t i = 0; i < fp.count; i++) {
-        for (size_t j = 0; j < n; j++) {
-            if (memcmp(fp.bssid[i], pa[j].bssid, 6) == 0) { sum += pa[j].rssi; cnt++; break; }
-        }
-    }
-    int avg = cnt ? sum / cnt : 0;
-
-    int  idx = -1, score = -1;
-    bool is_new = false, checking = false, unsure = false;
-    const char *dec = "?";
-    unsigned saved_count = 0;
-    if (xSemaphoreTake(s_db_mutex, pdMS_TO_TICKS(2000))) {
-        idx = place_db_find(&s_db, &fp, &score);
-        place_obs_t obs;
-        if (idx >= 0) {
-            s_sess.new_streak = 0;   // 命中,迟滞连击清零(observe 内部同理,双保险)
-            obs = PLACE_OBS_MATCH;
-        } else if (s_db.count == 0) {
-            obs = PLACE_OBS_NEW_COMMIT;   // 空库:首个地点直接建立,无需二次确认
-        } else {
-            obs = place_fp_observe(&s_sess, score);
-        }
-
-        if (obs == PLACE_OBS_MATCH) {
-            s_db.places[idx].visits++;
-            s_dirty = true;
-            dec = "KNOWN";
-        } else if (obs == PLACE_OBS_NEW_COMMIT && s_db.count < PLACE_MAX_COUNT) {
-            idx = s_db.count;
-            place_record_t *r = &s_db.places[idx];
-            memset(r, 0, sizeof(*r));
-            snprintf(r->name, sizeof(r->name), "PLACE %02u", (unsigned)(idx + 1));
-            r->visits = 1;
-            r->fp = fp;
-            s_db.count++;
-            s_dirty = true;
-            db_flush_locked();   // 新地点立即落盘,断电不丢
-            is_new = true;
-            dec = "NEW";
-        } else if (s_db.count >= PLACE_MAX_COUNT) {
-            dec = "FULL";        // 库满:不进入快速重扫循环,按常规周期重试
-        } else if (obs == PLACE_OBS_UNSURE) {
-            checking = true;     // 灰区:不建点,4s 后快速重扫
-            unsure = true;
-            dec = "UNSURE";
-        } else {
-            checking = true;     // NEW_PENDING:第一次明确不像,4s 后再确认一次
-            dec = "PENDING";
-        }
-        saved_count = s_db.count;
-        xSemaphoreGive(s_db_mutex);
-
-        char fp_line[48], match_line[48], saved_line[32], status_line[32];
-        snprintf(fp_line, sizeof(fp_line), "FP: %u APs  %d dBm  %s",
-                 fp.count, avg, strength_label(avg));
-        if (is_new) {
-            snprintf(status_line, sizeof(status_line), "NEW PLACE #%d!", idx + 1);
-            snprintf(match_line, sizeof(match_line), "SAVED AS #%d", idx + 1);
-        } else if (idx >= 0) {
-            snprintf(status_line, sizeof(status_line), "KNOWN PLACE #%d", idx + 1);
-            snprintf(match_line, sizeof(match_line), "MATCH %d%%", score / 10);
-        } else if (checking) {
-            // 迟滞态:绝不显示"新地点",只提示正在复核,避免误导
-            snprintf(status_line, sizeof(status_line), "CHECKING...");
-            if (unsure && score >= 0)
-                snprintf(match_line, sizeof(match_line), "WEAK %d%% - RESCAN SOON", score / 10);
-            else
-                snprintf(match_line, sizeof(match_line), "NEW? CONFIRMING...");
-        } else {
-            snprintf(status_line, sizeof(status_line), "UNKNOWN PLACE");
-            snprintf(match_line, sizeof(match_line), "LIBRARY FULL %d/%d",
-                     PLACE_MAX_COUNT, PLACE_MAX_COUNT);
-        }
-        snprintf(saved_line, sizeof(saved_line), "SAVED %u/%d", saved_count, PLACE_MAX_COUNT);
-
-        ESP_LOGI(TAG, "APs=%u fp=%u avg=%ddBm -> %s (idx=%d score=%d permille, streak=%u, saved=%u)",
-                 (unsigned)n, fp.count, avg, dec, idx, score,
-                 (unsigned)s_sess.new_streak, saved_count);
-
-        ui_publish(status_line,
-                   is_new ? UI_ORANGE :
-                   (idx >= 0 ? UI_GRASS_DARK :
-                    (checking ? UI_ORANGE : UI_RED)),
-                   fp_line, match_line, saved_line);
+    uint32_t current_ms = now_ms();
+    account_current_place(current_ms);
+    int score = -1;
+    int index = place_db_find(&s_db, &fp, &score);
+    place_obs_t observation;
+    if (index >= 0) {
+        s_match_session.new_streak = 0;
+        observation = PLACE_OBS_MATCH;
+    } else if (s_db.count == 0) {
+        observation = PLACE_OBS_NEW_COMMIT;
     } else {
-        ESP_LOGE(TAG, "获取地点库互斥量超时");
+        observation = place_fp_observe(&s_match_session, score);
     }
-    return checking ? QUICK_RESCAN_MS : SCAN_INTERVAL_MS;
+
+    bool newly_created = false;
+    bool checking = false;
+    if (observation == PLACE_OBS_NEW_COMMIT && s_db.count < PLACE_MAX_COUNT) {
+        index = s_db.count++;
+        memset(&s_db.places[index], 0, sizeof(s_db.places[index]));
+        snprintf(s_db.places[index].name, sizeof(s_db.places[index].name),
+                 "PLACE %02d", index + 1);
+        s_db.places[index].visits = 1;
+        s_db.places[index].fp = fp;
+        s_social.place_meta[index].icon = 5;
+        s_social.runtime_without_new_place_seconds = 0;
+        s_social.pet_stage =
+            passport_pet_stage_update(s_social.pet_stage, (uint8_t)s_db.count);
+        s_pending_name = index;
+        s_name_choice = 0;
+        newly_created = true;
+        s_dirty = true;
+        storage_flush();
+    } else if (observation == PLACE_OBS_UNSURE ||
+               observation == PLACE_OBS_NEW_PENDING) {
+        checking = true;
+    }
+
+    if (index >= 0) {
+        if (s_current_place != index) {
+            if (!newly_created && s_db.places[index].visits != UINT16_MAX) {
+                s_db.places[index].visits++;
+            }
+            s_current_place = index;
+            append_trail((uint8_t)index);
+            s_dirty = true;
+        }
+        s_last_account_ms = current_ms;
+        s_current_place_hash = passport_place_hash(fp.bssid, fp.count);
+        s_last_score = score;
+        char detail[64];
+        snprintf(detail, sizeof(detail), "%s / MATCH %d%% / %u saved",
+                 s_db.places[index].name, score < 0 ? 100 : score / 10,
+                 (unsigned)s_db.count);
+        show_live(newly_created ? "NEW PLACE" : "KNOWN PLACE", detail);
+    } else if (checking) {
+        s_last_score = score;
+        char detail[64];
+        snprintf(detail, sizeof(detail), "CHECKING %d%% / rescan in 4s",
+                 score < 0 ? 0 : score / 10);
+        show_live("VERIFYING PLACE", detail);
+    } else {
+        show_live("PLACE LIBRARY FULL", "16/16 saved");
+    }
+
+    ESP_LOGI(TAG, "Wi-Fi stage=%ums APs=%u fp=%u idx=%d score=%d hash=%02x",
+             (unsigned)(now_ms() - started), (unsigned)n, (unsigned)fp.count,
+             index, score, s_current_place_hash);
+    return checking ? QUICK_RESCAN_MS : CYCLE_MS;
 }
 
-static void place_worker(void *arg)
+static void ble_stage(void)
+{
+    size_t min_before =
+        heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t largest_before =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    uint32_t started = now_ms();
+    show_live("BLE NEARBY", s_social.stealth ? "Stealth: scan only" : "Advertise + scan");
+
+    passport_payload_t local = {
+        .anonymous_id = s_social.anonymous_id,
+        .signal_code = s_social.signal_code,
+        .place_hash = s_current_place_hash,
+        .tribe_code = s_social.tribe_code,
+        .icon_index = s_social.icon_index,
+        .pet_stage = s_social.pet_stage,
+    };
+    passport_ble_result_t result;
+    esp_err_t err = passport_ble_window(&local, s_social.stealth != 0, &result);
+    heap_report("ble-off", min_before, largest_before);
+    if (!s_active) return;
+    if (err == ESP_OK) {
+        process_ble_result(&result, now_ms());
+        update_battery_from_worker();
+        ESP_LOGI(TAG, "BLE stage=%ums same=%u other=%u crowd=%u",
+                 (unsigned)(now_ms() - started), (unsigned)result.peer_count,
+                 (unsigned)result.other_tribe_count,
+                 (unsigned)result.crowd.unique_count);
+    } else {
+        show_live("BLE FAILED", esp_err_to_name(err));
+    }
+}
+
+static uint32_t run_radio_cycle(void)
+{
+    uint32_t cycle_started = now_ms();
+    uint32_t next_delay = wifi_stage();
+    if (!s_active || next_delay == QUICK_RESCAN_MS) return next_delay;
+
+    show_live("RF GUARD", "Wi-Fi is off / waiting 1s");
+    vTaskDelay(pdMS_TO_TICKS(RF_GUARD_MS));
+    if (s_active) ble_stage();
+
+    uint32_t elapsed = now_ms() - cycle_started;
+    ESP_LOGI(TAG, "cycle active=%ums idle_target=%ums", (unsigned)elapsed,
+             elapsed < CYCLE_MS ? (unsigned)(CYCLE_MS - elapsed) : 0u);
+    return elapsed < CYCLE_MS ? CYCLE_MS - elapsed : 1000u;
+}
+
+static void apply_command(const command_t *command)
+{
+    switch (command->type) {
+    case CMD_NAME_PLACE:
+        if (s_pending_name >= 0 && s_pending_name < (int)s_db.count &&
+            command->value < 6) {
+            snprintf(s_db.places[s_pending_name].name,
+                     sizeof(s_db.places[s_pending_name].name), "%s",
+                     PLACE_NAMES[command->value]);
+            s_social.place_meta[s_pending_name].icon = command->value;
+            s_pending_name = -1;
+            s_dirty = true;
+            storage_flush();
+        }
+        break;
+    case CMD_NEXT_ARCHIVE:
+        if (s_db.count) s_archive_rank = (uint8_t)((s_archive_rank + 1) % s_db.count);
+        break;
+    case CMD_NEXT_SIGNAL:
+        s_social.signal_code =
+            (uint8_t)((s_social.signal_code + 1) % PASSPORT_SIGNAL_COUNT);
+        s_dirty = true;
+        storage_flush();
+        break;
+    case CMD_NEXT_ICON:
+        s_social.icon_index =
+            (uint8_t)((s_social.icon_index + 1) % PASSPORT_ICON_COUNT);
+        s_dirty = true;
+        storage_flush();
+        break;
+    case CMD_TOGGLE_STEALTH:
+        s_social.stealth = !s_social.stealth;
+        s_dirty = true;
+        storage_flush();
+        break;
+    case CMD_TOGGLE_REGULARS:
+        s_social.regulars_enabled = !s_social.regulars_enabled;
+        s_dirty = true;
+        storage_flush();
+        break;
+    case CMD_NEXT_REGULAR:
+        if (s_social.regulars.count) {
+            s_regular_cursor =
+                (uint8_t)((s_regular_cursor + 1) % s_social.regulars.count);
+        }
+        break;
+    case CMD_RESET_ID:
+        s_social.anonymous_id = random_nonzero_id();
+        memset(&s_social.regulars, 0, sizeof(s_social.regulars));
+        s_dirty = true;
+        storage_flush();
+        break;
+    default:
+        break;
+    }
+    render_view();
+}
+
+static void worker_task(void *arg)
 {
     (void)arg;
-    db_load();
-
-    uint32_t last_flush = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    uint32_t msg = 0;
+    storage_load();
+    uint32_t last_flush = now_ms();
+    command_t command;
     while (1) {
-        if (xQueueReceive(s_q, &msg, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            if (msg == MSG_IDLE) {
-                s_active = false;
-                s_scanning = false;
-                if (xSemaphoreTake(s_db_mutex, pdMS_TO_TICKS(2000))) {
-                    db_flush_locked();   // 退出前补一次落盘
-                    xSemaphoreGive(s_db_mutex);
-                }
-                continue;
-            }
-            if (msg == MSG_ACTIVE) {
+        uint32_t wait_ms = 500;
+        if (s_active && !s_scanning) {
+            uint32_t current = now_ms();
+            int32_t remaining = (int32_t)(s_next_due - current);
+            if (remaining <= 0) wait_ms = 0;
+            else if ((uint32_t)remaining < wait_ms) wait_ms = (uint32_t)remaining;
+        }
+
+        if (xQueueReceive(s_queue, &command, pdMS_TO_TICKS(wait_ms)) == pdTRUE) {
+            if (command.type == CMD_ACTIVE) {
                 s_active = true;
-                s_sess.new_streak = 0;   // 每次进页面重新开始迟滞判定
-                s_next_due = now;        // 立即触发首次扫描
-            } else if (msg == MSG_SCAN && s_active) {
-                s_next_due = now;
+                s_match_session.new_streak = 0;
+                s_last_account_ms = now_ms();
+                s_next_due = now_ms();
+                set_idle_power_mode(true);
+                render_view();
+            } else if (command.type == CMD_IDLE) {
+                account_current_place(now_ms());
+                finish_crowd(now_ms());
+                s_active = false;
+                s_current_place = -1;
+                set_idle_power_mode(false);
+                storage_flush();
+            } else if (command.type == CMD_SCAN && s_active) {
+                s_next_due = now_ms();
+            } else if (command.type == CMD_RENDER) {
+                render_view();
+            } else {
+                apply_command(&command);
             }
         }
 
-        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-        if (s_active && (int32_t)(now - s_next_due) >= 0) {
-            // CHECKING(灰区/待确认)时 run_cycle 返回 4s 快速重扫,否则 60s。
-            uint32_t next_delay = run_cycle();
-            s_next_due = xTaskGetTickCount() * portTICK_PERIOD_MS + next_delay;
-            now = s_next_due;
-            last_flush = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        uint32_t current = now_ms();
+        if (s_active && !s_scanning &&
+            (int32_t)(current - s_next_due) >= 0) {
+            uint32_t delay = run_radio_cycle();
+            s_next_due = now_ms() + delay;
+            render_view();
         }
-
-        // 到访次数节流落盘(新地点已在 run_cycle 内立即落盘)
-        if (s_active && s_dirty &&
-            (int32_t)(now - last_flush) >= FLUSH_THROTTLE_MS &&
-            xSemaphoreTake(s_db_mutex, pdMS_TO_TICKS(2000))) {
-            db_flush_locked();
-            xSemaphoreGive(s_db_mutex);
-            last_flush = now;
+        if (s_dirty && (uint32_t)(current - last_flush) >= FLUSH_THROTTLE_MS) {
+            storage_flush();
+            last_flush = current;
         }
     }
 }
 
-/* ---------------- 页面构建 ---------------- */
 static void build_ui(void)
 {
-    s_scr = ui_pixel_screen_create("PLACES");
+    s_scr = ui_pixel_screen_create("PASSPORT");
 
-    s_lbl_status = lv_label_create(s_scr);
-    lv_obj_set_style_text_font(s_lbl_status, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(s_lbl_status, lv_color_hex(UI_SKY_DARK), 0);
-    lv_obj_set_style_text_align(s_lbl_status, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(s_lbl_status, 220);
-    lv_obj_align(s_lbl_status, LV_ALIGN_TOP_MID, 0, 50);
-    lv_label_set_text(s_lbl_status, "STARTING...");
+    s_title = lv_label_create(s_scr);
+    lv_obj_set_width(s_title, 216);
+    lv_obj_set_style_text_font(s_title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(s_title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_title, lv_color_hex(UI_INK), 0);
+    lv_obj_align(s_title, LV_ALIGN_TOP_MID, 0, 48);
 
-    lv_obj_t *panel = ui_pixel_panel_create(s_scr, 10, 84, 220, 140, UI_PAPER);
+    lv_obj_t *panel = ui_pixel_panel_create(s_scr, 10, 72, 220, 150, UI_PAPER);
+    s_status = lv_label_create(panel);
+    lv_obj_set_width(s_status, 194);
+    lv_obj_set_style_text_font(s_status, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_align(s_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_status, lv_color_hex(UI_SKY_DARK), 0);
+    lv_obj_align(s_status, LV_ALIGN_TOP_MID, 0, 12);
 
-    s_lbl_fp = lv_label_create(panel);
-    lv_obj_set_style_text_font(s_lbl_fp, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(s_lbl_fp, lv_color_hex(UI_INK), 0);
-    lv_obj_align(s_lbl_fp, LV_ALIGN_TOP_LEFT, 2, 2);
-    lv_label_set_text(s_lbl_fp, "FP: -- APs");
+    s_detail = lv_label_create(panel);
+    lv_obj_set_width(s_detail, 194);
+    lv_obj_set_style_text_font(s_detail, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(s_detail, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_detail, lv_color_hex(UI_INK), 0);
+    lv_obj_align(s_detail, LV_ALIGN_TOP_MID, 0, 52);
 
-    s_lbl_match = lv_label_create(panel);
-    lv_obj_set_style_text_font(s_lbl_match, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(s_lbl_match, lv_color_hex(UI_SKY_DARK), 0);
-    lv_obj_align(s_lbl_match, LV_ALIGN_TOP_LEFT, 2, 26);
-    lv_label_set_text(s_lbl_match, "MATCH --");
+    s_local_pet = lv_image_create(panel);
+    lv_obj_set_pos(s_local_pet, 38, 78);
+    s_peer_pet = lv_image_create(panel);
+    lv_obj_set_pos(s_peer_pet, 112, 78);
+    s_icon = lv_image_create(panel);
+    lv_obj_align(s_icon, LV_ALIGN_BOTTOM_MID, 0, -8);
+    s_idle_mark = lv_label_create(panel);
+    lv_obj_set_style_text_font(s_idle_mark, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_idle_mark, lv_color_hex(UI_GRASS_DARK), 0);
+    lv_obj_set_pos(s_idle_mark, 88, 66);
+    lv_label_set_text(s_idle_mark, "^^  ...");
 
-    s_lbl_saved = lv_label_create(panel);
-    lv_obj_set_style_text_font(s_lbl_saved, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(s_lbl_saved, lv_color_hex(UI_INK), 0);
-    lv_obj_align(s_lbl_saved, LV_ALIGN_TOP_LEFT, 2, 50);
-    lv_label_set_text_fmt(s_lbl_saved, "SAVED 0/%d", PLACE_MAX_COUNT);
-
-    s_lbl_browse = lv_label_create(panel);
-    lv_obj_set_style_text_font(s_lbl_browse, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(s_lbl_browse, lv_color_hex(UI_GRASS_DARK), 0);
-    lv_obj_align(s_lbl_browse, LV_ALIGN_TOP_LEFT, 2, 76);
-    lv_label_set_text(s_lbl_browse, "LIVE");
-
-    s_lbl_next = lv_label_create(s_scr);
-    lv_obj_set_style_text_font(s_lbl_next, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(s_lbl_next, lv_color_hex(UI_PAPER), 0);
-    lv_obj_set_style_text_align(s_lbl_next, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(s_lbl_next, 220);
-    lv_obj_align(s_lbl_next, LV_ALIGN_TOP_MID, 0, 252);
-
-    lv_obj_t *hint = lv_label_create(s_scr);
-    lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(hint, lv_color_hex(UI_INK), 0);
-    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(hint, 220);
-    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 228);
-    lv_label_set_text(hint, "OK: scan   UP/DN: view");
-
-    // 电量放右上角云饰下方,避开标题牌(x<=156)与云朵(y<=25)
-    s_lbl_soc = lv_label_create(s_scr);
-    lv_obj_set_style_text_font(s_lbl_soc, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(s_lbl_soc, lv_color_hex(UI_INK), 0);
-    lv_obj_align(s_lbl_soc, LV_ALIGN_TOP_RIGHT, -8, 27);
-
-    // 吉祥物站草地(y272..320),与 hint(y228)/倒计时(y252)两行文字不重叠
-    ui_pixel_mascot_create(s_scr, 101, 272);
-}
-
-// 200ms 一拍:仅刷新"下次扫描倒计时"(纯内存/UI 轻操作,运行在 LVGL 任务)。
-static void tick(lv_timer_t *t)
-{
-    (void)t;
-    if (!s_lbl_next) return;
-    if (s_scanning) {
-        lv_label_set_text(s_lbl_next, "");
-        return;
+    for (size_t i = 0; i < 12; i++) {
+        s_trail_blocks[i] = lv_obj_create(panel);
+        lv_obj_remove_style_all(s_trail_blocks[i]);
+        lv_obj_set_size(s_trail_blocks[i], 14, 28);
+        lv_obj_set_pos(s_trail_blocks[i], 4 + (int)i * 16, 88);
+        lv_obj_set_style_border_width(s_trail_blocks[i], 1, 0);
+        lv_obj_set_style_border_color(s_trail_blocks[i], lv_color_hex(UI_INK), 0);
     }
-    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    int32_t rem = (int32_t)(s_next_due - now);
-    if (s_active && rem > 0) lv_label_set_text_fmt(s_lbl_next, "next scan: %ds", (int)(rem / 1000));
-    else                     lv_label_set_text(s_lbl_next, "");
+
+    s_dot = lv_label_create(s_scr);
+    lv_obj_set_style_bg_opa(s_dot, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(s_dot, lv_color_hex(UI_ORANGE), 0);
+    lv_obj_set_style_text_color(s_dot, lv_color_hex(UI_PAPER), 0);
+    lv_obj_set_style_radius(s_dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_pad_all(s_dot, 4, 0);
+    lv_obj_align(s_dot, LV_ALIGN_TOP_LEFT, 8, 26);
+
+    s_soc = lv_label_create(s_scr);
+    lv_obj_set_style_text_font(s_soc, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_soc, lv_color_hex(UI_INK), 0);
+    lv_obj_align(s_soc, LV_ALIGN_TOP_RIGHT, -8, 27);
+    lv_label_set_text(s_soc, "");
+
+    s_footer = lv_label_create(s_scr);
+    lv_obj_set_width(s_footer, 220);
+    lv_obj_set_style_text_font(s_footer, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(s_footer, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_footer, lv_color_hex(UI_INK), 0);
+    lv_obj_align(s_footer, LV_ALIGN_TOP_MID, 0, 236);
+
+    ui_pixel_mascot_create(s_scr, 101, 272);
+    render_view_locked();
 }
 
-/* ---------------- enter / exit / key ---------------- */
+static void timer_tick(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!s_scr) return;
+    s_animation_divider++;
+    if (s_view == VIEW_PET && (s_animation_divider % 4u) == 0 &&
+        !lv_obj_has_flag(s_local_pet, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_set_y(s_local_pet, lv_obj_get_y(s_local_pet) + (s_breath_up ? -1 : 1));
+        s_breath_up = !s_breath_up;
+    }
+    if (s_view == VIEW_LIVE && s_have_peer &&
+        (int32_t)(s_encounter_until_ms - now_ms()) > 0) {
+        if (s_encounter_phase < 8) {
+            lv_obj_set_x(s_local_pet, lv_obj_get_x(s_local_pet) + 4);
+            lv_obj_set_x(s_peer_pet, lv_obj_get_x(s_peer_pet) - 4);
+        } else if (s_encounter_phase < 16) {
+            lv_obj_set_x(s_local_pet, lv_obj_get_x(s_local_pet) - 4);
+            lv_obj_set_x(s_peer_pet, lv_obj_get_x(s_peer_pet) + 4);
+        }
+        if (s_encounter_phase < 16) s_encounter_phase++;
+    }
+    if (s_view == VIEW_LIVE && s_have_peer &&
+        (int32_t)(now_ms() - s_encounter_until_ms) >= 0) {
+        s_have_peer = false;
+        render_view_locked();
+    }
+}
+
+static void send_command(uint8_t type, uint8_t value)
+{
+    command_t command = { .type = type, .value = value };
+    if (s_queue) xQueueSend(s_queue, &command, 0);
+}
+
 void demo_place_enter(void)
 {
-    // worker 常驻:仅首次创建,enter/exit 不销毁,避免队列/任务生命周期竞态。
     if (!s_worker) {
-        s_db_mutex = xSemaphoreCreateMutex();
-        s_q = xQueueCreate(8, sizeof(uint32_t));
-        xTaskCreate(place_worker, "place", 6144, NULL, 3, &s_worker);
+        s_queue = xQueueCreate(12, sizeof(command_t));
     }
-
+    s_view = VIEW_LIVE;
     build_ui();
-    s_browse = -1;
-    s_timer = lv_timer_create(tick, 200, NULL);
+    s_timer = lv_timer_create(timer_tick, 250, NULL);
     lv_screen_load(s_scr);
-
-    uint32_t msg = MSG_ACTIVE;
-    xQueueSend(s_q, &msg, 0);
+    if (!s_worker) xTaskCreate(worker_task, "places", 7168, NULL, 3, &s_worker);
+    send_command(CMD_ACTIVE, 0);
 }
 
 void demo_place_exit(void)
 {
-    if (s_timer) { lv_timer_delete(s_timer); s_timer = NULL; }
-    uint32_t msg = MSG_IDLE;
-    if (s_q) xQueueSend(s_q, &msg, 0);
+    if (s_timer) {
+        lv_timer_delete(s_timer);
+        s_timer = NULL;
+    }
+    send_command(CMD_IDLE, 0);
     if (s_scr) {
         lv_obj_delete(s_scr);
         s_scr = NULL;
-        s_lbl_status = s_lbl_fp = s_lbl_match = s_lbl_saved = NULL;
-        s_lbl_browse = s_lbl_next = s_lbl_soc = NULL;
     }
+    s_title = s_status = s_detail = s_footer = s_soc = s_dot = NULL;
+    s_local_pet = s_peer_pet = s_icon = NULL;
+    s_idle_mark = NULL;
+    memset(s_trail_blocks, 0, sizeof(s_trail_blocks));
 }
 
-// 由 main.c 持 LVGL 锁后调用(OK 长按已被 main.c 拦截为返回)。
-// 只发队列消息 / 读内存模型,绝不阻塞。
-void demo_place_key(bsp_btn_t btn, bsp_btn_ev_t ev)
+void demo_place_key(bsp_btn_t button, bsp_btn_ev_t event)
 {
-    if (ev != BSP_BTN_CLICK) return;
-    if (btn == BSP_BTN_OK) {
-        uint32_t msg = MSG_SCAN;
-        if (s_q) xQueueSend(s_q, &msg, 0);
+    if (event == BSP_BTN_DOUBLE && s_pending_name < 0 &&
+        s_view == VIEW_REGULARS) {
+        send_command(CMD_TOGGLE_REGULARS, 0);
         return;
     }
-    if (btn != BSP_BTN_UP && btn != BSP_BTN_DOWN) return;
-    if (!s_lbl_browse) return;
-
-    int dir = (btn == BSP_BTN_DOWN) ? 1 : -1;
-    if (xSemaphoreTake(s_db_mutex, pdMS_TO_TICKS(200))) {
-        unsigned count = s_db.count;
-        if (count > 0) {
-            if (s_browse < 0) s_browse = (dir > 0) ? 0 : (int)count - 1;
-            else              s_browse = (s_browse + dir + (int)count) % (int)count;
-            place_record_t *r = &s_db.places[s_browse];
-            lv_label_set_text_fmt(s_lbl_browse,
-                                  "VIEW #%d  %s\nvisits: %" PRIu16 "   APs: %d",
-                                  s_browse + 1, r->name, r->visits, r->fp.count);
+    if (event != BSP_BTN_CLICK) return;
+    if (s_pending_name >= 0) {
+        if (button == BSP_BTN_UP) {
+            s_name_choice = (uint8_t)((s_name_choice + 5) % 6);
+            render_name_locked();
+        } else if (button == BSP_BTN_DOWN) {
+            s_name_choice = (uint8_t)((s_name_choice + 1) % 6);
+            render_name_locked();
+        } else if (button == BSP_BTN_OK) {
+            send_command(CMD_NAME_PLACE, s_name_choice);
         }
-        xSemaphoreGive(s_db_mutex);
+        return;
+    }
+
+    if (button == BSP_BTN_UP || button == BSP_BTN_DOWN) {
+        int direction = button == BSP_BTN_DOWN ? 1 : -1;
+        s_view = (place_view_t)((s_view + VIEW_COUNT + direction) % VIEW_COUNT);
+        send_command(CMD_RENDER, 0);
+        return;
+    }
+    if (button != BSP_BTN_OK) return;
+
+    switch (s_view) {
+    case VIEW_LIVE: send_command(CMD_SCAN, 0); break;
+    case VIEW_ARCHIVE: send_command(CMD_NEXT_ARCHIVE, 0); break;
+    case VIEW_SIGNAL: send_command(CMD_NEXT_SIGNAL, 0); break;
+    case VIEW_ICON: send_command(CMD_NEXT_ICON, 0); break;
+    case VIEW_STEALTH: send_command(CMD_TOGGLE_STEALTH, 0); break;
+    case VIEW_REGULARS:
+        send_command(s_social.regulars_enabled && s_social.regulars.count
+                         ? CMD_NEXT_REGULAR
+                         : CMD_TOGGLE_REGULARS,
+                     0);
+        break;
+    case VIEW_RESET_ID: send_command(CMD_RESET_ID, 0); break;
+    default: break;
     }
 }
