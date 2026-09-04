@@ -8,6 +8,7 @@
 #define PASSPORT_PAYLOAD_STAGE1_LEN      4u
 #define PASSPORT_PAYLOAD_STAGE2_LEN      7u
 #define PASSPORT_PAYLOAD_STAGE3_LEN      8u
+#define PASSPORT_PAYLOAD_QUIET_REPLY_LEN 10u
 #define PASSPORT_SIGNAL_COUNT            5u
 #define PASSPORT_ICON_COUNT              8u
 #define PASSPORT_QUIET_ICON              7u
@@ -16,6 +17,10 @@
 #define PASSPORT_CROWD_THRESHOLD         10u
 #define PASSPORT_MEMORIAL_MAX            8u
 #define PASSPORT_PLACE_NONE              0xffu
+#define PASSPORT_QUIET_REPLY_PROMPT_MS     30000u
+#define PASSPORT_QUIET_REPLY_SEND_MS      180000u
+#define PASSPORT_QUIET_REPLY_SUPPRESS_MS  300000u
+#define PASSPORT_QUIET_REPLY_ATTEMPTS          3u
 
 typedef struct {
     uint16_t anonymous_id;
@@ -24,6 +29,7 @@ typedef struct {
     uint16_t tribe_code;
     uint8_t icon_index;
     uint8_t pet_stage;
+    uint16_t quiet_reply_to_id;
 } passport_payload_t;
 
 typedef enum {
@@ -32,6 +38,17 @@ typedef enum {
     PASSPORT_FEEDBACK_ENCOUNTER,
     PASSPORT_FEEDBACK_QUIET,
 } passport_feedback_t;
+
+typedef struct {
+    uint16_t prompt_peer_id;
+    uint16_t outbound_peer_id;
+    uint16_t suppressed_peer_id;
+    uint8_t outbound_attempts;
+    uint8_t reserved;
+    uint32_t prompt_until_ms;
+    uint32_t outbound_until_ms;
+    uint32_t suppressed_until_ms;
+} passport_quiet_reply_state_t;
 
 typedef struct {
     uint16_t anonymous_id;
@@ -79,6 +96,17 @@ bool passport_mfg_decode(passport_payload_t *out, uint16_t company_id,
 
 passport_feedback_t passport_feedback_route(uint16_t local_tribe,
                                             const passport_payload_t *peer);
+bool passport_quiet_reply_matches(uint16_t local_id,
+                                  const passport_payload_t *peer);
+bool passport_quiet_reply_observe(passport_quiet_reply_state_t *state,
+                                  uint16_t peer_id, uint32_t now_ms);
+uint16_t passport_quiet_reply_prompt(
+    const passport_quiet_reply_state_t *state, uint32_t now_ms);
+uint16_t passport_quiet_reply_accept(passport_quiet_reply_state_t *state,
+                                     uint32_t now_ms);
+uint16_t passport_quiet_reply_outbound(
+    const passport_quiet_reply_state_t *state, uint32_t now_ms);
+void passport_quiet_reply_mark_sent(passport_quiet_reply_state_t *state);
 
 int passport_regular_observe(passport_regular_db_t *db, uint16_t anonymous_id,
                              uint8_t place_index, uint32_t now_ms);

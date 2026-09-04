@@ -44,12 +44,15 @@ size_t passport_payload_encode(uint8_t *out, size_t out_size,
     if (!out || !payload || out_size < payload_len ||
         (payload_len != PASSPORT_PAYLOAD_STAGE1_LEN &&
          payload_len != PASSPORT_PAYLOAD_STAGE2_LEN &&
-         payload_len != PASSPORT_PAYLOAD_STAGE3_LEN)) {
+         payload_len != PASSPORT_PAYLOAD_STAGE3_LEN &&
+         payload_len != PASSPORT_PAYLOAD_QUIET_REPLY_LEN)) {
         return 0;
     }
     if (payload->signal_code >= PASSPORT_SIGNAL_COUNT ||
         payload->icon_index >= PASSPORT_ICON_COUNT ||
-        payload->pet_stage > 5) {
+        payload->pet_stage > 5 ||
+        (payload_len == PASSPORT_PAYLOAD_QUIET_REPLY_LEN &&
+         payload->quiet_reply_to_id == 0)) {
         return 0;
     }
 
@@ -62,7 +65,11 @@ size_t passport_payload_encode(uint8_t *out, size_t out_size,
         out[5] = (uint8_t)(payload->tribe_code >> 8);
         out[6] = payload->icon_index;
     }
-    if (payload_len == PASSPORT_PAYLOAD_STAGE3_LEN) out[7] = payload->pet_stage;
+    if (payload_len >= PASSPORT_PAYLOAD_STAGE3_LEN) out[7] = payload->pet_stage;
+    if (payload_len == PASSPORT_PAYLOAD_QUIET_REPLY_LEN) {
+        out[8] = (uint8_t)(payload->quiet_reply_to_id & 0xffu);
+        out[9] = (uint8_t)(payload->quiet_reply_to_id >> 8);
+    }
     return payload_len;
 }
 
@@ -72,7 +79,8 @@ bool passport_payload_decode(passport_payload_t *out, const uint8_t *data,
     if (!out || !data ||
         (data_len != PASSPORT_PAYLOAD_STAGE1_LEN &&
          data_len != PASSPORT_PAYLOAD_STAGE2_LEN &&
-         data_len != PASSPORT_PAYLOAD_STAGE3_LEN)) {
+         data_len != PASSPORT_PAYLOAD_STAGE3_LEN &&
+         data_len != PASSPORT_PAYLOAD_QUIET_REPLY_LEN)) {
         return false;
     }
 
@@ -87,9 +95,14 @@ bool passport_payload_decode(passport_payload_t *out, const uint8_t *data,
         out->icon_index = data[6];
         if (out->icon_index >= PASSPORT_ICON_COUNT) return false;
     }
-    if (data_len == PASSPORT_PAYLOAD_STAGE3_LEN) {
+    if (data_len >= PASSPORT_PAYLOAD_STAGE3_LEN) {
         out->pet_stage = data[7];
         if (out->pet_stage > 5) out->pet_stage = 5;
+    }
+    if (data_len == PASSPORT_PAYLOAD_QUIET_REPLY_LEN) {
+        out->quiet_reply_to_id =
+            (uint16_t)data[8] | ((uint16_t)data[9] << 8);
+        if (out->quiet_reply_to_id == 0) return false;
     }
     return out->anonymous_id != 0;
 }
@@ -108,6 +121,76 @@ passport_feedback_t passport_feedback_route(uint16_t local_tribe,
     if (peer->tribe_code != local_tribe) return PASSPORT_FEEDBACK_OTHER_TRIBE;
     if (peer->icon_index == PASSPORT_QUIET_ICON) return PASSPORT_FEEDBACK_QUIET;
     return PASSPORT_FEEDBACK_ENCOUNTER;
+}
+
+bool passport_quiet_reply_matches(uint16_t local_id,
+                                  const passport_payload_t *peer)
+{
+    return local_id != 0 && peer && peer->quiet_reply_to_id == local_id;
+}
+
+static bool deadline_active(uint32_t deadline_ms, uint32_t now_ms)
+{
+    return deadline_ms != 0 && (int32_t)(deadline_ms - now_ms) > 0;
+}
+
+bool passport_quiet_reply_observe(passport_quiet_reply_state_t *state,
+                                  uint16_t peer_id, uint32_t now_ms)
+{
+    if (!state || peer_id == 0) return false;
+    if (state->suppressed_peer_id == peer_id &&
+        deadline_active(state->suppressed_until_ms, now_ms)) {
+        return false;
+    }
+    state->prompt_peer_id = peer_id;
+    state->prompt_until_ms = now_ms + PASSPORT_QUIET_REPLY_PROMPT_MS;
+    return true;
+}
+
+uint16_t passport_quiet_reply_prompt(
+    const passport_quiet_reply_state_t *state, uint32_t now_ms)
+{
+    if (!state ||
+        !deadline_active(state->prompt_until_ms, now_ms)) {
+        return 0;
+    }
+    return state->prompt_peer_id;
+}
+
+uint16_t passport_quiet_reply_accept(passport_quiet_reply_state_t *state,
+                                     uint32_t now_ms)
+{
+    uint16_t peer_id = passport_quiet_reply_prompt(state, now_ms);
+    if (peer_id == 0) return 0;
+    state->outbound_peer_id = peer_id;
+    state->outbound_until_ms = now_ms + PASSPORT_QUIET_REPLY_SEND_MS;
+    state->outbound_attempts = PASSPORT_QUIET_REPLY_ATTEMPTS;
+    state->suppressed_peer_id = peer_id;
+    state->suppressed_until_ms =
+        now_ms + PASSPORT_QUIET_REPLY_SUPPRESS_MS;
+    state->prompt_peer_id = 0;
+    state->prompt_until_ms = 0;
+    return peer_id;
+}
+
+uint16_t passport_quiet_reply_outbound(
+    const passport_quiet_reply_state_t *state, uint32_t now_ms)
+{
+    if (!state || state->outbound_attempts == 0 ||
+        !deadline_active(state->outbound_until_ms, now_ms)) {
+        return 0;
+    }
+    return state->outbound_peer_id;
+}
+
+void passport_quiet_reply_mark_sent(passport_quiet_reply_state_t *state)
+{
+    if (!state) return;
+    if (state->outbound_attempts > 0) state->outbound_attempts--;
+    if (state->outbound_attempts == 0) {
+        state->outbound_peer_id = 0;
+        state->outbound_until_ms = 0;
+    }
 }
 
 static bool older(uint32_t lhs, uint32_t rhs)
