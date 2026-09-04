@@ -65,11 +65,12 @@ typedef enum {
     CMD_TOGGLE_REGULARS,
     CMD_NEXT_REGULAR,
     CMD_RESET_ID,
+    CMD_QUIET_REPLY,
 } command_type_t;
 
 typedef struct {
     uint8_t type;
-    uint8_t value;
+    uint16_t value;
 } command_t;
 
 typedef enum {
@@ -168,6 +169,7 @@ static bool s_have_peer;
 static uint16_t s_other_tribe_count;
 static uint32_t s_encounter_until_ms;
 static bool s_quiet_message;
+static passport_quiet_reply_state_t s_quiet_reply;
 static int s_last_score = -1;
 static char s_live_status[32] = "STARTING...";
 static char s_live_detail[96] = "Waiting for first scan";
@@ -449,6 +451,9 @@ static void render_view_locked(void)
         lv_label_set_text(s_title, "PLACES + NEARBY");
         lv_label_set_text(s_status, s_live_status);
         lv_label_set_text(s_detail, s_live_detail);
+        if (passport_quiet_reply_prompt(&s_quiet_reply, now_ms()) != 0) {
+            lv_label_set_text(s_footer, "OK: stay with them");
+        }
         if (s_have_peer && (int32_t)(s_encounter_until_ms - now_ms()) > 0) {
             uint8_t local_stage = s_social.pet_stage < 6 ? s_social.pet_stage : 5;
             uint8_t peer_stage = s_last_peer.pet_stage < 6 ? s_last_peer.pet_stage : 5;
@@ -642,6 +647,31 @@ static void process_ble_result(const passport_ble_result_t *result,
 
     for (uint8_t i = 0; i < result->peer_count; i++) {
         const passport_payload_t *peer = &result->peers[i];
+        if (peer->tribe_code == s_social.tribe_code &&
+            passport_quiet_reply_matches(s_social.anonymous_id, peer)) {
+            s_quiet_message = true;
+            s_have_peer = false;
+            s_quiet_reply.prompt_peer_id = 0;
+            s_quiet_reply.prompt_until_ms = 0;
+            s_encounter_until_ms = current_ms + 4000u;
+            snprintf(s_live_status, sizeof(s_live_status), "SOMEONE STAYED");
+            snprintf(s_live_detail, sizeof(s_live_detail),
+                     "A nearby wmls stayed with you");
+            return;
+        }
+    }
+
+    for (uint8_t i = 0; i < result->peer_count; i++) {
+        const passport_payload_t *peer = &result->peers[i];
+        if (peer->quiet_reply_to_id != 0 ||
+            passport_feedback_route(s_social.tribe_code, peer) !=
+                PASSPORT_FEEDBACK_QUIET) {
+            continue;
+        }
+        if (!passport_quiet_reply_observe(&s_quiet_reply,
+                                          peer->anonymous_id, current_ms)) {
+            continue;
+        }
         s_last_peer = *peer;
         if (s_social.same_tribe_encounters != UINT32_MAX) {
             s_social.same_tribe_encounters++;
@@ -650,22 +680,41 @@ static void process_ble_result(const passport_ble_result_t *result,
             passport_regular_observe(&s_social.regulars, peer->anonymous_id,
                                      (uint8_t)s_current_place, current_ms);
         }
-        passport_feedback_t feedback =
-            passport_feedback_route(s_social.tribe_code, peer);
-        s_quiet_message = feedback == PASSPORT_FEEDBACK_QUIET;
-        s_have_peer = !s_quiet_message;
+        s_quiet_message = true;
+        s_have_peer = false;
+        snprintf(s_live_status, sizeof(s_live_status), "QUIET SIGNAL");
+        snprintf(s_live_detail, sizeof(s_live_detail),
+                 "Quiet signal from #%04X\nOK: stay with them",
+                 peer->anonymous_id);
+        s_dirty = true;
+        return;
+    }
+
+    for (uint8_t i = 0; i < result->peer_count; i++) {
+        const passport_payload_t *peer = &result->peers[i];
+        if (peer->quiet_reply_to_id != 0 ||
+            passport_feedback_route(s_social.tribe_code, peer) ==
+                PASSPORT_FEEDBACK_QUIET) {
+            continue;
+        }
+        s_last_peer = *peer;
+        if (s_social.same_tribe_encounters != UINT32_MAX) {
+            s_social.same_tribe_encounters++;
+        }
+        if (s_social.regulars_enabled && s_current_place >= 0) {
+            passport_regular_observe(&s_social.regulars, peer->anonymous_id,
+                                     (uint8_t)s_current_place, current_ms);
+        }
+        s_quiet_message = false;
+        s_have_peer = true;
         s_encounter_until_ms = current_ms + 4000u;
         s_encounter_phase = 0;
-        if (s_quiet_message) {
-            snprintf(s_live_detail, sizeof(s_live_detail),
-                     "Quiet signal from #%04X", peer->anonymous_id);
-        } else {
-            snprintf(s_live_detail, sizeof(s_live_detail),
-                     "Met #%04X / %s / %s",
-                     peer->anonymous_id, ICON_NAMES[peer->icon_index],
-                     SIGNAL_NAMES[peer->signal_code]);
-            play_encounter_tone();
-        }
+        snprintf(s_live_status, sizeof(s_live_status), "SAME TRIBE NEARBY");
+        snprintf(s_live_detail, sizeof(s_live_detail),
+                 "Met #%04X / %s / %s",
+                 peer->anonymous_id, ICON_NAMES[peer->icon_index],
+                 SIGNAL_NAMES[peer->signal_code]);
+        play_encounter_tone();
         s_dirty = true;
     }
 }
@@ -798,6 +847,12 @@ static void ble_stage(void)
     uint32_t started = now_ms();
     show_live("BLE NEARBY", s_social.stealth ? "Stealth: scan only" : "Advertise + scan");
 
+    uint32_t current_ms = now_ms();
+    uint16_t quiet_reply_target =
+        s_social.stealth
+            ? 0
+            : passport_quiet_reply_outbound(&s_quiet_reply, current_ms);
+    bool quiet_reply_pending = quiet_reply_target != 0;
     passport_payload_t local = {
         .anonymous_id = s_social.anonymous_id,
         .signal_code = s_social.signal_code,
@@ -805,6 +860,7 @@ static void ble_stage(void)
         .tribe_code = s_social.tribe_code,
         .icon_index = s_social.icon_index,
         .pet_stage = s_social.pet_stage,
+        .quiet_reply_to_id = quiet_reply_target,
     };
     passport_ble_result_t result;
     esp_err_t err = passport_ble_window(&local, s_social.stealth != 0, &result);
@@ -812,6 +868,12 @@ static void ble_stage(void)
     if (!s_active) return;
     if (err == ESP_OK) {
         process_ble_result(&result, now_ms());
+        if (quiet_reply_pending) {
+            passport_quiet_reply_mark_sent(&s_quiet_reply);
+            snprintf(s_live_status, sizeof(s_live_status), "QUIET REPLY SENT");
+            snprintf(s_live_detail, sizeof(s_live_detail),
+                     "They will see: someone stayed");
+        }
         update_battery_from_worker();
         ESP_LOGI(TAG, "BLE stage=%ums same=%u other=%u crowd=%u",
                  (unsigned)(now_ms() - started), (unsigned)result.peer_count,
@@ -890,6 +952,21 @@ static void apply_command(const command_t *command)
         s_dirty = true;
         storage_flush();
         break;
+    case CMD_QUIET_REPLY: {
+        uint32_t current_ms = now_ms();
+        if (s_social.stealth) {
+            show_live("STEALTH IS ON", "Turn it off before replying");
+        } else if (command->value != 0 &&
+                   command->value ==
+                       passport_quiet_reply_prompt(&s_quiet_reply,
+                                                   current_ms) &&
+                   passport_quiet_reply_accept(&s_quiet_reply,
+                                               current_ms) != 0) {
+            s_next_due = current_ms;
+            show_live("SENDING QUIET REPLY", "Stay nearby for a moment");
+        }
+        break;
+    }
     default:
         break;
     }
@@ -1047,9 +1124,15 @@ static void timer_tick(lv_timer_t *timer)
         s_have_peer = false;
         render_view_locked();
     }
+    if (s_view == VIEW_LIVE && s_quiet_reply.prompt_peer_id &&
+        passport_quiet_reply_prompt(&s_quiet_reply, now_ms()) == 0) {
+        s_quiet_reply.prompt_peer_id = 0;
+        s_quiet_reply.prompt_until_ms = 0;
+        render_view_locked();
+    }
 }
 
-static void send_command(uint8_t type, uint8_t value)
+static void send_command(uint8_t type, uint16_t value)
 {
     command_t command = { .type = type, .value = value };
     if (s_queue) xQueueSend(s_queue, &command, 0);
@@ -1115,7 +1198,17 @@ void demo_place_key(bsp_btn_t button, bsp_btn_ev_t event)
     if (button != BSP_BTN_OK) return;
 
     switch (s_view) {
-    case VIEW_LIVE: send_command(CMD_SCAN, 0); break;
+    case VIEW_LIVE:
+        {
+            uint16_t peer_id =
+                passport_quiet_reply_prompt(&s_quiet_reply, now_ms());
+            if (peer_id != 0) {
+                send_command(CMD_QUIET_REPLY, peer_id);
+            } else {
+                send_command(CMD_SCAN, 0);
+            }
+        }
+        break;
     case VIEW_ARCHIVE: send_command(CMD_NEXT_ARCHIVE, 0); break;
     case VIEW_SIGNAL: send_command(CMD_NEXT_SIGNAL, 0); break;
     case VIEW_ICON: send_command(CMD_NEXT_ICON, 0); break;

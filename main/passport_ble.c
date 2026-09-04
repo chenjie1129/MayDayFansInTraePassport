@@ -67,6 +67,10 @@ static void observe_advertisement(const struct ble_gap_disc_desc *disc)
         peer.anonymous_id == s_ctx->local.anonymous_id) {
         return;
     }
+    if (peer.quiet_reply_to_id != 0 &&
+        peer.quiet_reply_to_id != s_ctx->local.anonymous_id) {
+        return;
+    }
 
     passport_feedback_t route =
         passport_feedback_route(s_ctx->local.tribe_code, &peer);
@@ -126,20 +130,23 @@ static void host_task(void *arg)
 
 static int run_advertise(uint32_t duration_ms)
 {
-    uint8_t payload[PASSPORT_PAYLOAD_STAGE3_LEN];
-    uint8_t mfg[2 + PASSPORT_PAYLOAD_STAGE3_LEN];
+    uint8_t payload[PASSPORT_PAYLOAD_QUIET_REPLY_LEN];
+    uint8_t mfg[2 + PASSPORT_PAYLOAD_QUIET_REPLY_LEN];
+    size_t payload_len = s_ctx->local.quiet_reply_to_id
+                             ? PASSPORT_PAYLOAD_QUIET_REPLY_LEN
+                             : PASSPORT_PAYLOAD_STAGE3_LEN;
     if (passport_payload_encode(payload, sizeof(payload), &s_ctx->local,
-                                sizeof(payload)) != sizeof(payload)) {
+                                payload_len) != payload_len) {
         return BLE_HS_EINVAL;
     }
     mfg[0] = (uint8_t)(PASSPORT_COMPANY_ID & 0xffu);
     mfg[1] = (uint8_t)(PASSPORT_COMPANY_ID >> 8);
-    memcpy(mfg + 2, payload, sizeof(payload));
+    memcpy(mfg + 2, payload, payload_len);
 
     struct ble_hs_adv_fields fields = { 0 };
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     fields.mfg_data = mfg;
-    fields.mfg_data_len = sizeof(mfg);
+    fields.mfg_data_len = 2 + payload_len;
     int rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) return rc;
 

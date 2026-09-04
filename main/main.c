@@ -11,6 +11,7 @@
 #include "bsp_battery.h"
 #include "bsp_pins.h"      // 错误日志里要打印 BSP_LCD_* 引脚号
 #include "demo.h"
+#include "publisher_capture.h"
 #include "ui_pixel.h"
 #include "lvgl.h"
 #include "esp_log.h"
@@ -159,6 +160,7 @@ void app_main(void) {
     // 拖在异常状态, 扫描/事务可能长时间阻塞 —— 绝不能让菜单为音频/电量计陪葬。
     if (bsp_lvgl_lock(1000)) { enter_menu(); bsp_lvgl_unlock(); }
     ESP_LOGI(TAG, "M5 menu up");
+    publisher_capture_start();
 
     // 其余外设单项失败不阻塞:菜单里标 [FAIL],其他项照常可测。
     bsp_i2c_scan();
