@@ -1,6 +1,8 @@
 # --- 目标芯片 ---
 CONFIG_IDF_TARGET="esp32c3"
 # 注:ESP32-C3 无 PSRAM,故不设 CONFIG_SPIRAM。
+CONFIG_WIFI_PORTAL_FIXED_TEST_PASSWORD=y
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 
 # --- Flash ---
 # FoloToy AI Passport 当前产品/固件基线使用 8MB Flash。
@@ -37,6 +39,10 @@ CONFIG_LV_MEM_SIZE_KILOBYTES=24
 
 # --- 系统 ---
 CONFIG_FREERTOS_HZ=1000
+# Captive Portal receives several parallel iOS probe requests. Keep enough
+# sockets and event-task stack for APSTA, DNS, HTTP and DHCP events together.
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+CONFIG_LWIP_MAX_SOCKETS=20
 
 # --- Bluetooth LE / NimBLE ---
 # ESP32-C3 仅支持 BLE；示例只启用单连接 peripheral 所需的最小 host 配置。

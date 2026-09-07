@@ -14,6 +14,7 @@
 #include "pet_sprites.h"
 #include "tribe_icon_pack.h"
 #include "ui_pixel.h"
+#include "wifi_portal.h"
 
 #include "bsp_audio.h"
 #include "bsp_battery.h"
@@ -989,7 +990,13 @@ static void worker_task(void *arg)
         }
 
         if (xQueueReceive(s_queue, &command, pdMS_TO_TICKS(wait_ms)) == pdTRUE) {
+            esp_err_t wifi_err;
             if (command.type == CMD_ACTIVE) {
+                wifi_err = wifi_portal_suspend();
+                if (wifi_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Persistent Wi-Fi suspend failed: %s",
+                             esp_err_to_name(wifi_err));
+                }
                 s_active = true;
                 s_match_session.new_streak = 0;
                 s_last_account_ms = now_ms();
@@ -1003,6 +1010,12 @@ static void worker_task(void *arg)
                 s_current_place = -1;
                 set_idle_power_mode(false);
                 storage_flush();
+                wifi_err = wifi_portal_resume();
+                if (wifi_err != ESP_OK &&
+                    wifi_err != ESP_ERR_INVALID_STATE) {
+                    ESP_LOGW(TAG, "Persistent Wi-Fi resume failed: %s",
+                             esp_err_to_name(wifi_err));
+                }
             } else if (command.type == CMD_SCAN && s_active) {
                 s_next_due = now_ms();
             } else if (command.type == CMD_RENDER) {

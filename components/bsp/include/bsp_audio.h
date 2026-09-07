@@ -20,5 +20,8 @@ esp_err_t bsp_audio_set_format(uint32_t hz, uint8_t bits, uint8_t ch);
 esp_err_t bsp_audio_write(const void *pcm, size_t bytes);
 esp_err_t bsp_audio_read(void *pcm, size_t bytes);
 
+// 关闭当前音频流并释放 codec 运行时资源；后续 set_format 可重新打开。
+void bsp_audio_close(void);
+
 // 输出音量 0..100(%)。
 void bsp_audio_set_volume(uint8_t percent);

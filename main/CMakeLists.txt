@@ -8,10 +8,13 @@ idf_component_register(
          "demo_battery.c"
          "demo_radio.c"
          "demo_wifi.c"
+         "wifi_portal.c"
+         "wifi_session.c"
          "demo_ble.c"
          "demo_low_power.c"
          "demo_woodfish.c"
          "demo_answer.c"
+         "deepseek_answer.c"
          "answer_24.c"
          "demo_place.c"
          "place_fp.c"
@@ -23,5 +26,6 @@ idf_component_register(
          "assets/tribe_icons_mayday.c"
          "assets/pet_sprites.c"
     INCLUDE_DIRS "." "assets"
-    REQUIRES bsp bt esp_driver_usb_serial_jtag esp_event esp_hw_support esp_netif esp_pm esp_timer esp_wifi nvs_flash
+    EMBED_FILES "wifi_portal.html"
+    REQUIRES bsp bt dns_server esp_driver_usb_serial_jtag esp_event esp_http_client esp_http_server esp_hw_support esp_netif esp_pm esp_timer esp_wifi json mbedtls nvs_flash
 )

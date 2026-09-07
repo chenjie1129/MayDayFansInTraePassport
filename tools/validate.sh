@@ -41,7 +41,7 @@ run_static_checks() {
         -o "${test_dir}/test_passport_pet"
     "${test_dir}/test_passport_pet"
     bash main/assets/host_test/run.sh
-    python3 tests/test_verify_firmware.py
+    python3 -m unittest discover -s tests -p 'test_*.py'
     rm -rf "${test_dir}"
     echo "Host tests: PASS"
 }

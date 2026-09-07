@@ -1,0 +1,12 @@
+menu "Wi-Fi portal"
+
+config WIFI_PORTAL_FIXED_TEST_PASSWORD
+    bool "Use the fixed Wi-Fi portal password in test firmware"
+    default n
+    help
+        Use 88888888 for the temporary setup access point. Enable only for
+        supervised hardware testing because the portal carries Wi-Fi and API
+        credentials. Production firmware must leave this disabled so each
+        setup session receives a random password.
+
+endmenu

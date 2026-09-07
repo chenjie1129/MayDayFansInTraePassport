@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#f4f6f8">
+  <title>Wi-Fi 配网</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f4f6f8;
+      color: #17212b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px 18px;
+    }
+    main {
+      width: min(100%, 420px);
+      background: #ffffff;
+      border: 1px solid #d8dee5;
+      border-radius: 8px;
+      padding: 24px;
+      box-shadow: 0 12px 30px rgba(23, 33, 43, 0.08);
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 24px;
+      line-height: 1.25;
+      letter-spacing: 0;
+    }
+    p {
+      margin: 0 0 22px;
+      color: #52606d;
+      font-size: 14px;
+      line-height: 1.55;
+    }
+    label {
+      display: block;
+      margin: 16px 0 6px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .network-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 44px;
+      gap: 8px;
+    }
+    select, input, button {
+      width: 100%;
+      min-height: 44px;
+      border: 1px solid #aeb8c2;
+      border-radius: 6px;
+      background: #ffffff;
+      color: #17212b;
+      font: inherit;
+      letter-spacing: 0;
+    }
+    select, input { padding: 10px 12px; }
+    button {
+      cursor: pointer;
+      font-weight: 650;
+    }
+    button:disabled { cursor: wait; opacity: 0.6; }
+    #refresh {
+      font-size: 20px;
+      padding: 0;
+    }
+    #submit {
+      margin-top: 22px;
+      border-color: #087f5b;
+      background: #087f5b;
+      color: #ffffff;
+    }
+    #status {
+      min-height: 44px;
+      margin-top: 16px;
+      padding: 11px 12px;
+      border-left: 3px solid #8c98a4;
+      background: #f4f6f8;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    #status[data-state="ok"] { border-color: #087f5b; }
+    #status[data-state="error"] { border-color: #c92a2a; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>连接 Wi-Fi</h1>
+    <p>选择设备要连接的 2.4 GHz 网络。</p>
+    <form id="form">
+      <label for="ssid">Wi-Fi 网络</label>
+      <div class="network-row">
+        <select id="ssid" name="ssid" required>
+          <option value="">正在扫描...</option>
+        </select>
+        <button id="refresh" type="button" title="重新扫描" aria-label="重新扫描">↻</button>
+      </div>
+
+      <label for="password">密码</label>
+      <input id="password" name="password" type="password"
+             autocomplete="current-password" maxlength="63">
+
+      <label for="apiKey">DeepSeek API Key（Answer 功能，可选）</label>
+      <input id="apiKey" name="api_key" type="password"
+             autocomplete="off" maxlength="128" placeholder="sk-...">
+
+      <button id="submit" type="submit">连接</button>
+    </form>
+    <div id="status" role="status" aria-live="polite">等待选择网络</div>
+  </main>
+
+  <script>
+    const form = document.querySelector("#form");
+    const ssid = document.querySelector("#ssid");
+    const password = document.querySelector("#password");
+    const apiKey = document.querySelector("#apiKey");
+    const refresh = document.querySelector("#refresh");
+    const submit = document.querySelector("#submit");
+    const status = document.querySelector("#status");
+
+    function setStatus(message, state = "") {
+      status.textContent = message;
+      status.dataset.state = state;
+    }
+
+    async function loadNetworks() {
+      refresh.disabled = true;
+      setStatus("正在扫描附近网络...");
+      try {
+        const response = await fetch("/api/networks", { cache: "no-store" });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "scan_failed");
+
+        ssid.replaceChildren();
+        for (const network of data.networks) {
+          const option = document.createElement("option");
+          option.value = network.ssid;
+          option.textContent = `${network.ssid}  ${network.rssi} dBm`;
+          option.dataset.open = network.open ? "1" : "0";
+          ssid.append(option);
+        }
+        if (!data.networks.length) {
+          ssid.append(new Option("没有发现网络", ""));
+        }
+        setStatus(`发现 ${data.networks.length} 个网络`);
+      } catch {
+        setStatus("扫描失败，请点击重新扫描", "error");
+      } finally {
+        refresh.disabled = false;
+      }
+    }
+
+    async function pollStatus() {
+      try {
+        const response = await fetch("/api/status", { cache: "no-store" });
+        const data = await response.json();
+        if (data.state === "online") {
+          setStatus("连接成功，可以关闭此页面", "ok");
+          return;
+        }
+        if (data.state === "failed") {
+          setStatus("连接失败，请检查密码后重试", "error");
+          submit.disabled = false;
+          return;
+        }
+        setStatus("设备正在连接...");
+        setTimeout(pollStatus, 1000);
+      } catch {
+        setStatus("设备已关闭配网热点，正在切换到目标 Wi-Fi", "ok");
+      }
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      submit.disabled = true;
+      setStatus("正在提交...");
+
+      const body = new URLSearchParams({
+        ssid: ssid.value,
+        password: password.value,
+        api_key: apiKey.value,
+      });
+      try {
+        const response = await fetch("/api/connect", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body,
+        });
+        if (!response.ok) throw new Error("connect_failed");
+        password.value = "";
+        apiKey.value = "";
+        setStatus("设备正在连接...");
+        setTimeout(pollStatus, 600);
+      } catch {
+        setStatus("提交失败，请重新连接配网热点", "error");
+        submit.disabled = false;
+      }
+    });
+
+    refresh.addEventListener("click", loadNetworks);
+    loadNetworks();
+  </script>
+</body>
+</html>

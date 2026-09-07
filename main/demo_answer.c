@@ -1,7 +1,7 @@
 // main/demo_answer.c —— 答案之书玩法。
 //
-// 心中默念一个问题, 按 OK: 书页翻动 (~1.3s 悬念动画 + 翻书音效), 然后揭晓
-// 一句答案。三副牌组 (经典 / 打工人 / 程序员), UP/DOWN 随时切换。
+// 心中默念一个问题, 按 OK: 后台连接 Wi-Fi 并调用 DeepSeek, 模型返回本地
+// 答案库中的编号后揭晓。三副牌组 (经典 / 打工人 / 程序员) 可切换。
 //
 // 按键语义:
 //   OK 短按   -> 封面/答案页: 开始翻书; 翻书中: 忽略 (防抖)
@@ -10,11 +10,12 @@
 //
 // 任务模型 (与 demo_woodfish.c 同一纪律):
 //   * LVGL 任务里【绝不碰外设】: 按键回调与 lv_timer 只改内存状态/UI 属性/发队列。
-//   * 音频合成与 bsp_audio_write 阻塞播放全部在独立 ans_audio 任务 (优先级 3,
-//     栈 4096), 常驻、幂等创建, enter/exit 不销毁。
+//   * 揭晓音在 DeepSeek 请求完成后才创建临时 ans_audio 任务；播放后立即关闭 codec
+//     并释放任务栈，避免无 PSRAM 设备上的 TLS 握手内存不足。
 //   * 视觉反馈零 draw-layer 分配: 悬念动画只用 opa 闪烁/文本切换; 答案淡入用
 //     style_opa 动画 (无 zoom/rotation, C3 无 PSRAM 下每帧分配 layer 会饿死 IDLE)。
-//   * 无任何 Flash 写入: 答案之书不需要持久化, 零 NVS 磨损。
+//   * Wi-Fi 凭证和 DeepSeek API Key 只从本次开机的 RAM 会话读取。
+//   * API 只返回 0..15 的答案编号，屏幕仍使用受控本地字库，拒绝任意文本。
 //
 // 中文渲染: 答案/书名/牌组名使用子集字体 lv_font_answer_24 (由 main/answers.json
 // 经 tools/gen_answer_data.js + lv_font_conv 生成, 仅含 176 个用到的汉字)。
@@ -25,12 +26,11 @@
 #include "bsp_audio.h"
 #include "ui_pixel.h"
 #include "answer_data.h"
+#include "deepseek_answer.h"
 #include "lvgl.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
 #include "esp_log.h"
-#include "esp_random.h"
 #include <math.h>
 #include <string.h>
 
@@ -39,29 +39,29 @@ static const char *TAG = "answer";
 LV_FONT_DECLARE(lv_font_answer_24);
 
 /* ---------------- 纯逻辑模型 ---------------- */
-enum { STATE_COVER = 0, STATE_SHAKING = 1, STATE_ANSWER = 2 };
+enum {
+    STATE_COVER = 0,
+    STATE_REQUESTING = 1,
+    STATE_ANSWER = 2,
+    STATE_ERROR = 3,
+};
 
 #define SHAKE_MS      1300   /* 翻书悬念时长 */
 #define SHAKE_FRAME   180    /* 帧切换间隔 */
 #define AUDIO_RATE    16000
-#define PCM_LEN       4000   /* 0.25s @16kHz, 8KB 静态 */
 #define PING_LEN      1920   /* 0.12s 单音 */
 
 static uint8_t s_state;
 static uint8_t s_deck;
 static int     s_last[ANSWER_DECK_COUNT];
 
-/* 队列消息: 1 = 翻书 whoosh, 2 = 揭晓三连音 */
-#define MSG_WHOOSH 1
-#define MSG_REVEAL 2
-static QueueHandle_t s_audio_q;
-static TaskHandle_t  s_audio_task;
+static TaskHandle_t s_audio_task;
 
 /* ---------------- UI 对象 ---------------- */
 static lv_obj_t  *s_scr, *s_book, *s_page, *s_q, *s_dots;
 static lv_obj_t  *s_answer, *s_deck_cn, *s_hint;
 static lv_timer_t *s_timer;
-static uint32_t  s_shake_start;
+static uint32_t  s_request_start;
 
 /* ---------------- 音频合成 (worker 任务内使用) ---------------- */
 static void clamp_pcm(int16_t *buf, int n) {
@@ -71,21 +71,6 @@ static void clamp_pcm(int16_t *buf, int n) {
         if (v < -32768) v = -32768;
         buf[i] = (int16_t)v;
     }
-}
-
-/* 翻书声: 低通白噪声, 亮->闷 + 快起音平方衰减包络 */
-static void build_whoosh(int16_t *buf) {
-    float lp = 0.0f;
-    for (int i = 0; i < PCM_LEN; i++) {
-        float t = (float)i / PCM_LEN;
-        float nse = (float)((int)(esp_random() & 0xFFFF) - 0x8000) / 32768.0f;
-        float coef = 0.38f - 0.32f * t;          /* 截止频率随时间下移 */
-        lp += (nse - lp) * coef;
-        float env = (t < 0.08f) ? (t / 0.08f) : (1.0f - (t - 0.08f) / 0.92f);
-        env *= env;
-        buf[i] = (int16_t)(lp * env * 1.7f * 32767.0f);
-    }
-    clamp_pcm(buf, PCM_LEN);
 }
 
 /* 揭晓音: 钟声 ping (基频 + 二次谐波, 指数衰减) */
@@ -102,27 +87,30 @@ static void build_ping(int16_t *buf, int freq) {
     clamp_pcm(buf, PING_LEN);
 }
 
-static void answer_worker(void *arg) {
+static void answer_audio_worker(void *arg) {
     (void)arg;
-    bsp_audio_init();                  /* 幂等 (app_main 已 init) */
-    bsp_audio_set_format(AUDIO_RATE, 16, 1);
-    bsp_audio_set_volume(75);
-
-    static int16_t pcm[PCM_LEN];
+    static int16_t pcm[PING_LEN];
     static const int ping_freq[3] = { 1046, 1318, 1568 };  /* C6 E6 G6 上行 */
-    int msg = 0;
-    while (1) {
-        if (xQueueReceive(s_audio_q, &msg, portMAX_DELAY) != pdTRUE) continue;
-        if (msg == MSG_WHOOSH) {
-            build_whoosh(pcm);
-            bsp_audio_write(pcm, sizeof(pcm));
-        } else if (msg == MSG_REVEAL) {
-            for (int i = 0; i < 3; i++) {
-                build_ping(pcm, ping_freq[i]);
-                bsp_audio_write(pcm, PING_LEN * (int)sizeof(int16_t));
-                vTaskDelay(pdMS_TO_TICKS(45));
-            }
+    if (bsp_audio_init() == ESP_OK &&
+        bsp_audio_set_format(AUDIO_RATE, 16, 1) == ESP_OK) {
+        bsp_audio_set_volume(75);
+        for (int i = 0; i < 3; i++) {
+            build_ping(pcm, ping_freq[i]);
+            bsp_audio_write(pcm, PING_LEN * (int)sizeof(int16_t));
+            vTaskDelay(pdMS_TO_TICKS(45));
         }
+    }
+    bsp_audio_close();
+    s_audio_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void play_reveal_sound(void) {
+    if (s_audio_task != NULL) return;
+    if (xTaskCreate(answer_audio_worker, "ans_audio", 4096, NULL, 3,
+                    &s_audio_task) != pdPASS) {
+        s_audio_task = NULL;
+        ESP_LOGW(TAG, "Unable to allocate reveal audio task");
     }
 }
 
@@ -236,12 +224,28 @@ static void show_cover(void) {
     s_state = STATE_COVER;
     lv_obj_remove_flag(s_book, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_page, LV_OBJ_FLAG_HIDDEN);
-    lv_label_set_text(s_hint, "OK: ASK    UP/DOWN: DECK");
+    deepseek_answer_snapshot_t network;
+    deepseek_answer_get_snapshot(&network);
+    if (network.state == DEEPSEEK_ANSWER_NEEDS_WIFI) {
+        lv_label_set_text(s_hint, "OPEN WI-FI APP FIRST");
+    } else if (network.state == DEEPSEEK_ANSWER_NEEDS_API_KEY) {
+        lv_label_set_text(s_hint, "ADD API KEY IN WI-FI APP");
+    } else if (network.state == DEEPSEEK_ANSWER_CONNECTING) {
+        lv_label_set_text(s_hint, "CONNECTING...");
+    } else if (network.state == DEEPSEEK_ANSWER_ERROR) {
+        lv_label_set_text(s_hint, "NETWORK UNAVAILABLE");
+    } else {
+        lv_label_set_text(s_hint, "OK: ASK    UP/DOWN: DECK");
+    }
 }
 
-static void start_shaking(void) {
-    s_state = STATE_SHAKING;
-    s_shake_start = xTaskGetTickCount() * portTICK_PERIOD_MS;
+static void start_request(void) {
+    if (deepseek_answer_request(s_deck) != ESP_OK) {
+        show_cover();
+        return;
+    }
+    s_state = STATE_REQUESTING;
+    s_request_start = xTaskGetTickCount() * portTICK_PERIOD_MS;
     lv_obj_add_flag(s_book, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_q, LV_OBJ_FLAG_HIDDEN);
@@ -249,8 +253,6 @@ static void start_shaking(void) {
     lv_label_set_text(s_answer, "");
     lv_obj_set_style_opa(s_q, LV_OPA_COVER, 0);
     lv_label_set_text(s_hint, "READING...");
-    int m = MSG_WHOOSH;
-    if (s_audio_q) xQueueSend(s_audio_q, &m, 0);
 }
 
 /* 答案淡入: style_opa 动画, 不分配 draw layer */
@@ -258,13 +260,10 @@ static void set_obj_opa(void *obj, int32_t v) {
     lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)v, 0);
 }
 
-static void reveal(void) {
+static void reveal(int idx) {
     s_state = STATE_ANSWER;
-
-    /* 随机抽答案, 避免与本副牌上一次相同 */
-    int idx = (int)(esp_random() % ANSWERS_PER_DECK);
-    if (idx == s_last[s_deck])
-        idx = (idx + 1 + (int)(esp_random() % (ANSWERS_PER_DECK - 1))) % ANSWERS_PER_DECK;
+    if (idx < 0 || idx >= ANSWERS_PER_DECK) idx = 0;
+    if (idx == s_last[s_deck]) idx = (idx + 1) % ANSWERS_PER_DECK;
     s_last[s_deck] = idx;
 
     lv_label_set_text(s_answer, ANSWERS[s_deck][idx]);
@@ -281,21 +280,67 @@ static void reveal(void) {
     lv_anim_start(&a);
 
     lv_label_set_text(s_hint, "OK: AGAIN    LONG: MENU");
-    int m = MSG_REVEAL;
-    if (s_audio_q) xQueueSend(s_audio_q, &m, 0);
+    play_reveal_sound();
     ESP_LOGI(TAG, "reveal deck=%d idx=%d: %s", s_deck, idx, ANSWERS[s_deck][idx]);
 }
 
-/* 每 100ms: 仅翻书状态做帧动画与到时揭晓, 其余状态零开销 */
+static void show_request_error(deepseek_answer_error_t error, int http_status) {
+    s_state = STATE_ERROR;
+    lv_obj_add_flag(s_q, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_dots, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_opa(s_answer, LV_OPA_COVER, 0);
+    switch (error) {
+    case DEEPSEEK_ERROR_AUTH:
+        lv_label_set_text(s_answer, "API KEY REJECTED");
+        lv_label_set_text(s_hint, "UPDATE KEY IN WI-FI APP");
+        break;
+    case DEEPSEEK_ERROR_RATE_LIMIT:
+        lv_label_set_text(s_answer, "RATE LIMITED");
+        lv_label_set_text(s_hint, "WAIT, THEN OK TO RETRY");
+        break;
+    case DEEPSEEK_ERROR_TIMEOUT:
+        lv_label_set_text(s_answer, "REQUEST TIMEOUT");
+        lv_label_set_text(s_hint, "OK: RETRY");
+        break;
+    case DEEPSEEK_ERROR_WIFI:
+        lv_label_set_text(s_answer, "NETWORK ERROR");
+        lv_label_set_text(s_hint, "CONNECT WI-FI FIRST");
+        break;
+    case DEEPSEEK_ERROR_RESPONSE:
+        lv_label_set_text(s_answer, "BAD API RESPONSE");
+        lv_label_set_text(s_hint, "OK: RETRY");
+        break;
+    default:
+        lv_label_set_text_fmt(s_answer, "API ERROR\nHTTP %d", http_status);
+        lv_label_set_text(s_hint, "OK: RETRY");
+        break;
+    }
+}
+
+/* 每 100ms: 轮询 worker 快照并驱动零分配的等待动画。 */
 static void tick(lv_timer_t *t) {
     (void)t;
-    if (s_state != STATE_SHAKING) return;
-    uint32_t el = (xTaskGetTickCount() * portTICK_PERIOD_MS) - s_shake_start;
-    uint32_t frame = el / SHAKE_FRAME;
+    deepseek_answer_snapshot_t network;
+    deepseek_answer_get_snapshot(&network);
+
+    if (s_state == STATE_COVER) {
+        show_cover();
+        return;
+    }
+    if (s_state != STATE_REQUESTING) return;
+
+    uint32_t elapsed =
+        (xTaskGetTickCount() * portTICK_PERIOD_MS) - s_request_start;
+    uint32_t frame = elapsed / SHAKE_FRAME;
     lv_obj_set_style_opa(s_q, (frame & 1U) ? LV_OPA_30 : LV_OPA_COVER, 0);
     static const char *dots[3] = { ".", "..", "..." };
     lv_label_set_text(s_dots, dots[frame % 3]);
-    if (el >= SHAKE_MS) reveal();
+    if (network.state == DEEPSEEK_ANSWER_RESULT &&
+        elapsed >= SHAKE_MS) {
+        reveal(network.answer_index);
+    } else if (network.state == DEEPSEEK_ANSWER_ERROR) {
+        show_request_error(network.error, network.http_status);
+    }
 }
 
 /* ---------------- 接口: enter / exit / key ---------------- */
@@ -304,11 +349,7 @@ void demo_answer_enter(void) {
     s_deck = 0;
     for (int i = 0; i < ANSWER_DECK_COUNT; i++) s_last[i] = -1;
 
-    if (!s_audio_task) {      /* worker 常驻, 幂等创建 */
-        s_audio_q = xQueueCreate(8, sizeof(int));
-        xTaskCreate(answer_worker, "ans_audio", 4096, NULL, 3, &s_audio_task);
-    }
-
+    deepseek_answer_start();
     build_ui();
     show_cover();
 
@@ -319,6 +360,7 @@ void demo_answer_enter(void) {
 
 void demo_answer_exit(void) {
     if (s_timer) { lv_timer_delete(s_timer); s_timer = NULL; }
+    deepseek_answer_stop();
     if (s_scr) {
         lv_obj_delete(s_scr);
         s_scr = NULL;
@@ -331,9 +373,13 @@ void demo_answer_exit(void) {
 void demo_answer_key(bsp_btn_t btn, bsp_btn_ev_t ev) {
     if (ev != BSP_BTN_CLICK) return;
     if (btn == BSP_BTN_OK) {
-        if (s_state == STATE_COVER || s_state == STATE_ANSWER) start_shaking();
+        if (s_state == STATE_COVER ||
+            s_state == STATE_ANSWER ||
+            s_state == STATE_ERROR) {
+            start_request();
+        }
     } else if (btn == BSP_BTN_UP || btn == BSP_BTN_DOWN) {
-        if (s_state == STATE_SHAKING) return;      /* 翻书中不切牌组 */
+        if (s_state == STATE_REQUESTING) return;
         int dir = (btn == BSP_BTN_UP) ? (ANSWER_DECK_COUNT - 1) : 1;
         s_deck = (uint8_t)((s_deck + dir) % ANSWER_DECK_COUNT);
         lv_label_set_text(s_deck_cn, ANSWER_DECK_NAMES[s_deck]);
